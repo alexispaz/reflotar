@@ -1,0 +1,9 @@
+#!/bin/sh
+# rsh-agente -- rsync's "remote shell" for `flota pasar`: the host is an AI user of this
+# machine. rsync runs `rsh-agente <AI user> rsync --server ...`; the receiving (or
+# sending) end then runs AS that AI user, from / (it cannot enter your folders), and
+# only rsync's own end runs there. FLOTA_RSH_DIRECTO=1 (the tests) skips sudo.
+u=$1; shift
+cd / || exit 1
+if [ -n "$FLOTA_RSH_DIRECTO" ]; then exec "$@"; fi
+exec sudo -u "$u" -- "$@"

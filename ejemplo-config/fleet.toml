@@ -1,0 +1,100 @@
+# fleet.toml -- your fleet's configuration. Copy it to flota-<you>/fleet.toml, beside
+# your clone of flota, and fill it in. The planner installs it at
+# /home/agents/etc/fleet/fleet.toml, where the sessions read it and cannot change it.
+#
+# Declarations only. What the tools observe goes to [paths] state, never here.
+
+[human]
+name     = "Your name"                  # how the sessions call you, in their rules
+user     = "you"                        # your Linux user on this machine
+aliases  = []                           # other words the sessions use for you
+timezone = "America/Argentina/Cordoba"  # times are quoted to you in this zone
+
+# The AI users: the Linux users that run sessions, each with its provider (claude or
+# codex) and its roles: coord (coordinator), arquitecto (architect), or maestro (the
+# pensadero's: a fleet of its own, apart from the rest). Any user name will do; these
+# are the example's. Leave out the lines you do not use: codex and the pensadero are
+# optional. One AI user per role and provider, and at most one maestro, which may have
+# providers = ["claude", "codex"]: when one runs out of tokens, it goes on with the
+# other (relevo). ("pensadero" is the maestro role's old name, still read.) The
+# other AI users have one provider, for now. ([agents] is this table's old name.)
+[ai_users]
+claude    = { provider = "claude", roles = ["coord", "arquitecto"] }
+codex     = { provider = "codex",  roles = ["coord"] }
+pensadero = { providers = ["claude", "codex"], roles = ["maestro"] }
+
+# What each user may take of this machine (systemd slices). Your session first. No
+# MemoryHigh for AI users: past MemoryMax the biggest process dies, nothing freezes.
+# Size them to the machine (these fit 16 GB). One line per AI user, by its name.
+[resources]
+human     = { CPUWeight = 1000, MemoryLow = "4G" }
+claude    = { CPUWeight = 100,  MemoryMax = "7G", MemorySwapMax = "2G" }
+codex     = { CPUWeight = 100,  MemoryMax = "7G", MemorySwapMax = "2G" }
+pensadero = { CPUWeight = 100,  MemoryMax = "2G", MemorySwapMax = "1G" }
+
+[paths]
+state = "~/.local/state/fleet"
+
+# How many messages a coordinator may exchange with one session after you last spoke
+# to it, before it reports to you (fleetlog since-human).
+[messages]
+report_after = 10
+
+# fleetcontext: when a session counts as big, and how often coord reminds you.
+# [context]
+# compact_above  = 250000   # tokens of context
+# idle_minutes   = 10       # quiet this long before compacting is suggested
+# remind_minutes = 5        # coord's one-line reminder, at most this often
+# compact_focus  = ""       # empty: a plain /compact; or what the summary must keep
+
+# The codex version each AI user that runs codex gets (`flota actualizar codex`). Fixed:
+# a fixed version does not update itself. Releases: github.com/openai/codex/releases
+# [software]
+# codex = "0.167.0"
+
+# How long a session you told "quedate atento" waits for its mail before it stops
+# by itself (buzon esperar). 120 minutes if absent.
+# [buzon]
+# atento_minutos = 120
+
+# Folders on this machine, outside every home, that a working AI user may write
+# besides its ~/work: a group's software stack, say. Each is yours, group agents,
+# 2775, no ACL; its parent must exist, and gets o+x. The whole agents group can write
+# it: the list says who does. Leave the block out to give none.
+# readable: folders of your home an AI user reads live, read-only, at ~/<its name>
+# (bindfs, which you install). A folder with credentials at its top is refused.
+# [machine]
+# writable = { claude = ["/home/shared/agents"] }
+# readable = { claude = ["~/drive"], pensadero = ["~/drive"] }
+
+# The fleet tools herramientas/install copies into /home/agents.
+[install]
+tools  = ["fleetlog", "fleetregister", "fleetwatch", "fleetcontext", "vigilar"]
+skills = []
+
+# Clusters an AI user may work on: one [cluster.<name>] each, <name> being the ssh alias
+# in the AI users' ~/.ssh/config (docs/clusters.md, "Adding a cluster"). An AI user works
+# only inside its box there; a cluster not listed here is not available.
+#
+#   user          your user on that cluster
+#   scheduler     "slurm", ...
+#   skill         the site skill to read before working there (skills/<name>)
+#   box           AI user -> its box; one not listed has no access there
+#   slurm_in_box  true: the sessions may submit jobs (a job runs OUTSIDE the box)
+#   writable      AI user -> folders outside its box it may also write
+#   readable      AI user -> folders it may read that the box would otherwise hide;
+#                 in your home, both must be ~/agents/compartido or inside it
+#   query_timeout seconds fleetwatch waits for the cluster's report (default 60);
+#                 raise it for a cluster whose login node is sometimes slow
+#   vpn           the interface a VPN makes ("ppp*", "tun*"): with it down, the
+#                 agents' ssh to this cluster fails before sending a packet
+#
+# After a change here: commit, sistema/instalar --go, then
+# clusters/add-cluster <cluster> <AI user> --go, which makes the cluster match.
+#
+# [cluster.example]
+# user         = "you"
+# scheduler    = "slurm"
+# skill        = "ccad"
+# box          = { claude = "/home/you/agents/claude" }
+# slurm_in_box = false

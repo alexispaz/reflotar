@@ -1,0 +1,245 @@
+#!/bin/bash
+# puerta -- the door an agent's ssh key goes through on a cluster. The agent gets a
+# box in which, of the human's files, only its own folder exists. There it may do
+# anything; the rest of the human's home, ~/.ssh included, is not there.
+#
+# Lives on the CLUSTER, in the human's account, beside the agents' folders:
+#
+#   ~/agents/puerta        this script (the human's; outside every box)
+#   ~/agents/ocultar       optional: more paths to hide, one per line (README:
+#                          "Hiding more paths")
+#   ~/agents/slurm-claude  optional: if it exists, claude may use Slurm (below)
+#   ~/agents/escribir-claude  optional: folders outside the box claude may also
+#                          write, one per line (a group's shared software stack)
+#   ~/agents/leer-codex    optional: folders codex may read, one per line
+#   ~/agents/compartido/   what the agents share in your home: the only place in
+#                          it a listed folder may be, itself or a folder inside
+#                          (a stack claude builds and codex runs, say)
+#   ~/agents/claude/       claude's box
+#
+# and is forced by the agent's key in ~/.ssh/authorized_keys:
+#
+#   restrict,pty,command="/home/<you>/agents/puerta claude" ssh-ed25519 AAAA... claude@<machine>
+#
+#   puerta AGENT           run $SSH_ORIGINAL_COMMAND (or a login shell) in AGENT's box
+#   puerta AGENT --check   build the box and list what is writable outside it
+#   (ssh) puerta-estado [JOB...]   what the agent runs here, for fleetwatch (below)
+#
+# How the box holds (checked 2026-10-01; docs/clusters.md has the test):
+# - A user and mount namespace (unshare). The human's home, /tmp, /var/tmp,
+#   /dev/shm and /run/user/<uid> get an empty tmpfs on top; the box is mounted back
+#   at its own path, so a path means the same inside and out.
+# - The mounts are made as the namespace's root, and the agent's command then runs
+#   WITHOUT capabilities: as the human's own uid in a nested namespace (util-linux
+#   2.38+), or else as the namespace's root with every capability dropped
+#   (setpriv). Keeping them would let the agent unmount the tmpfs and see the home
+#   again. From a namespace of its own it cannot either: the kernel locks the
+#   mounts it inherited.
+# - Every other mount is made read-only: the box, and the folders the human lists in
+#   escribir-<agent>, are the only places it can write.
+#   ~/.ssh is hidden by its real path as well, wherever it lives.
+# - /run/munge is hidden too, so there is no Slurm inside, unless the human created
+#   ~/agents/slurm-<agent>. With Slurm the box is NOT a limit any more: a job runs
+#   on a compute node outside it, with the whole account (srun's tasks too). The
+#   box then guards against mistakes in what the agent runs on the login node;
+#   folders the human made read-only (chmod -R a-w) or backed up are what is safe.
+# - Set-uid programs (crontab, at, sudo) gain nothing in a user namespace.
+set -euo pipefail
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+umask 077
+
+agente=${1:-}
+case $agente in ''|*[!a-z0-9-]*) echo "usage: puerta AGENT [--check]" >&2; exit 2 ;; esac
+modo=${2:-run}
+aqui=$(dirname "$(readlink -f "$0")")
+caja=$aqui/$agente
+[ -d "$caja" ] || { echo "puerta: no box at $caja" >&2; exit 2; }
+casa=$(readlink -f "$(getent passwd "$(id -un)" | cut -d: -f6)")
+
+# ~/.ssh by its real path too, in case it is a link elsewhere: whoever can write
+# authorized_keys can drop this door. When sshd reads keys from another folder
+# altogether (the CCAD clusters: /dotssh/<user>), the human lists it in ocultar.
+ocultar=("$casa" "$(readlink -f "$casa/.ssh")" /tmp /var/tmp "/run/user/$(id -u)")
+[ -e "$aqui/slurm-$agente" ] || ocultar+=(/run/munge)
+if [ -f "$aqui/ocultar" ]; then
+  while IFS= read -r p; do
+    case $p in ''|'#'*) ;; *) ocultar+=("$(readlink -f "$p")") ;; esac
+  done < "$aqui/ocultar"
+fi
+
+# The inside goes as an argument, not on stdin: stdin is the ssh channel, which
+# rsync and sftp need.
+# Folders outside the box the agent may also write (escribir-<agent>) or read
+# (leer-<agent>). Each must exist and must not lie under anything hidden, with one
+# exception: ~/agents/compartido or a folder inside it, which is in the hidden
+# home but shared on purpose. A link out of it resolves elsewhere and is refused.
+# Anything wrong keeps the door shut.
+compartido="$aqui/compartido"
+listados() {   # listados FILE: its folders, checked, one per line
+  [ -f "$1" ] || return 0
+  local p e h
+  while IFS= read -r p; do
+    case $p in ''|'#'*) continue ;; esac
+    e=$(readlink -f "$p")
+    [ -d "$e" ] || { echo "puerta: ${1##*/}: no folder $p" >&2; return 1; }
+    for h in "${ocultar[@]}"; do
+      case $e/ in "$h"/*)
+        case $e/ in "$compartido"/*) [ "$h" = "$casa" ] && continue ;; esac
+        echo "puerta: ${1##*/}: $p is under hidden $h" >&2; return 1 ;;
+      esac
+    done
+    printf '%s\n' "$e"
+  done < "$1"
+}
+escribir=$(listados "$aqui/escribir-$agente") || exit 1
+leer=$(listados "$aqui/leer-$agente") || exit 1
+[ -n "$escribir" ] && escribir+=$'\n'
+[ -n "$leer" ] && leer+=$'\n'
+
+# puerta-estado: what the agent has running on this cluster, for fleetwatch. It runs
+# OUTSIDE the box, because from inside one box the kernel will not show where a
+# process of another box runs. So it is a fixed report: it takes nothing from the
+# agent but job ids (digits), and tells only about the agent's box and the folders
+# listed in escribir-<agent>. Lines are kind|fields; "end|" closes a full report.
+# unset for an interactive login and for --check run by hand: -u must not trip on it
+pedido=${SSH_ORIGINAL_COMMAND:-}
+if [ "${pedido%% *}" = puerta-estado ]; then
+  ids=${pedido#puerta-estado}
+  case $ids in *[!0-9_\ ]*) echo "puerta-estado: job ids are digits" >&2; exit 2 ;; esac
+  suyo() {   # is this path in the box, or in a folder listed for the agent?
+    case $1/ in "$caja"/*) return 0 ;; esac
+    while IFS= read -r e; do
+      [ -n "$e" ] && case $1/ in "$e"/*) return 0 ;; esac
+    done <<< "$escribir"
+    return 1
+  }
+  echo "host|$(uname -n)"
+  for p in /proc/[0-9]*; do
+    [ -O "$p" ] || continue
+    c=$(readlink "$p/cwd" 2>/dev/null) || continue
+    case $c/ in "$caja"/*) ;; *) continue ;; esac
+    pid=${p#/proc/}
+    # fields after the last ')' of stat: ppid is the 2nd, starttime the 20th
+    read -r ppid st < <(awk '{n=split($0,a,")"); split(a[n],f," "); print f[2], f[20]}' "$p/stat" 2>/dev/null) || continue
+    et=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    args=$(tr '\0|' ' /' < "$p/cmdline" 2>/dev/null | cut -c1-200)
+    echo "proc|$pid|$ppid|$st|${et:-0}|$c|$args"
+  done
+  if command -v squeue >/dev/null 2>&1; then
+    if cola=$(squeue -u "$(id -un)" -h -o '%F|%i|%T|%r|%Z' 2>/dev/null); then
+      while IFS='|' read -r padre id estado razon wd; do
+        [ -n "$padre" ] && suyo "$wd" && echo "job|$padre|$id|$estado|$razon|$wd"
+      done <<< "$cola"
+      echo "squeue|ok"
+    else
+      echo "squeue|failed"
+    fi
+    for j in $ids; do
+      fila=$(sacct -j "$j" -X -n -P --format=State,WorkDir 2>/dev/null | head -1)
+      suyo "${fila#*|}" && echo "final|$j|$(sacct -j "$j" -X -n -P --format=State 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ,)"
+    done
+  else
+    echo "squeue|absent"
+  fi
+  echo "end|"
+  exit 0
+fi
+
+read -r -d '' adentro <<'CAJA' || true
+set -euo pipefail
+caja=$1 modo=$2 uid=$3 gid=$4 escribir=$5 leer=$6; shift 6
+# a fresh /dev/shm holds the box, and every listed folder, while everything above
+# them is covered; then each goes back to its own path, as a mount of its own.
+# The writable ones are left out of the read-only pass below; the read ones are not.
+mount -n -t tmpfs -o mode=700 puerta /dev/shm
+mkdir /dev/shm/caja
+mount -n --bind "$caja" /dev/shm/caja
+i=0 montados=""
+while IFS= read -r e; do
+  [ -n "$e" ] || continue
+  i=$((i + 1)); mkdir "/dev/shm/m$i"; mount -n --bind "$e" "/dev/shm/m$i"
+  montados+="$i|$e"$'\n'
+done <<< "$escribir$leer"
+for p in "$@"; do
+  if [ -d "$p" ]; then mount -n -t tmpfs -o mode=700 puerta "$p"; fi
+done
+mkdir -p "$caja"
+mount -n --move /dev/shm/caja "$caja"
+while IFS='|' read -r i e; do
+  [ -n "$i" ] || continue
+  mkdir -p "$e"; mount -n --move "/dev/shm/m$i" "$e"
+done <<< "$montados"
+mkdir -p "$caja/tmp"
+
+# Everything else read-only. The box is the only place the agent can write: not
+# the human's other folders, nor other users' group- or world-writable ones (seen
+# on mendieta), nor the empty tmpfs over the home, where a file would vanish with
+# the session while looking saved. Only the box and the scratch folders stay
+# writable. A mount that can be reached and cannot be made read-only keeps the
+# door shut; one this user cannot even reach (another user's FUSE) is skipped.
+nl=$'\n'
+puestos="$nl$caja$nl/dev/shm$nl/tmp$nl/var/tmp$nl$escribir"
+while read -r t o; do
+  case $t in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*) continue ;; esac
+  case $puestos in *"$nl$t$nl"*) continue ;; esac
+  case ,$o, in *,ro,*) continue ;; esac
+  mount -n -o remount,bind,ro "$t" 2>/dev/null && continue
+  if ls -d "$t/." >/dev/null 2>&1; then
+    echo "puerta: cannot make $t read-only; not opening" >&2; exit 1
+  fi
+done < <(findmnt -rn -o TARGET,OPTIONS)
+
+entrar() {   # the agent's command, with no capabilities
+  umask 022   # what it builds can later be shared; it is all inside the box anyway
+  if unshare --help 2>&1 | grep -q -- --map-user; then
+    # util-linux 2.38+: a nested namespace in which the agent is the human's uid
+    exec unshare --user --map-user="$uid" --map-group="$gid" \
+      env HOME="$caja" TMPDIR="$caja/tmp" "$@"
+  fi
+  # older util-linux: stay the namespace's root, with every capability dropped,
+  # the bounding set too, so no exec can bring one back. Tools see uid 0.
+  exec setpriv --inh-caps=-all --bounding-set=-all --no-new-privs \
+    env HOME="$caja" TMPDIR="$caja/tmp" "$@"
+}
+
+if [ "$modo" = --check ]; then
+  entrar bash -c '
+    caja=$1 uid=$2 escribir=$3 malo=0
+    # mountinfo also lists the mounts puerta covered, so a directory is judged by
+    # the filesystem actually visible there: its device, against puerta tmpfs
+    nuestros=" "
+    while read -r mp; do nuestros+="$(stat -c %d "$mp") "
+    done < <(findmnt -rn -o TARGET,SOURCE | awk "\$2 == \"puerta\" {print \$1}")
+    while IFS= read -r mp; do
+      case $mp in /proc|/proc/*|/sys|/sys/*|/dev|/dev/*) continue ;; esac
+      while IFS= read -r d; do
+        case $d/ in "$caja"/*) continue ;; esac
+        while IFS= read -r e; do
+          [ -n "$e" ] && case $d/ in "$e"/*) continue 2 ;; esac
+        done <<< "$escribir"
+        case $nuestros in *" $(stat -c %d "$d") "*) continue ;; esac
+        if [ -k "$d" ] && [ "$(stat -c %u "$d")" != "$uid" ]; then
+          echo "shared, sticky (others cannot touch your files there): $d"
+        else
+          echo "WRITABLE outside the box: $d"; malo=1
+        fi
+      done < <(find "$mp" -xdev -maxdepth 3 -type d -writable 2>/dev/null)
+    done < <(findmnt -rn -o TARGET | sort -u)
+    [ $malo = 0 ] && echo "ok: nothing of yours is writable outside $caja"
+    exit $malo' _ "$caja" "$uid" "$escribir"
+fi
+
+cd "$caja"
+cmd=${SSH_ORIGINAL_COMMAND:-}
+case $cmd in
+  '') entrar bash -l ;;
+  internal-sftp|sftp|*/sftp-server)
+    for s in /usr/libexec/openssh/sftp-server /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server; do
+      [ -x "$s" ] && entrar "$s"
+    done
+    echo "puerta: no sftp-server" >&2; exit 1 ;;
+  *) entrar bash -lc "$cmd" ;;
+esac
+CAJA
+exec unshare --user --map-root-user --mount --propagation private \
+  bash -c "$adentro" puerta "$caja" "$modo" "$(id -u)" "$(id -g)" "$escribir" "$leer" "${ocultar[@]}"

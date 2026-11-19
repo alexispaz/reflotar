@@ -1,0 +1,17 @@
+#!/bin/sh
+# ssh for the fleet's AI users: their own ~/.ssh/config, never the system's.
+#
+# Inside codex's sandbox, root's files show owner 65534 (a user namespace), and ssh
+# refuses the system files /etc/ssh/ssh_config includes ("Bad owner or permissions on
+# /etc/ssh/ssh_config.d/...", exit 255, 2026-10-16). -F reads only the user's file.
+# The system's only holds this machine's proxies (systemd, libvirt), which the agents
+# do not use. An -F of the caller's own is left alone. Installed first on PATH by the
+# planner; scp, rsync and git find it there too.
+real=${FLOTA_SSH_REAL:-/usr/bin/ssh}
+for a in "$@"; do
+  case $a in -F|-F?*) exec "$real" "$@" ;; esac
+done
+if [ -f "$HOME/.ssh/config" ]; then
+  exec "$real" -F "$HOME/.ssh/config" "$@"
+fi
+exec "$real" -F /dev/null "$@"

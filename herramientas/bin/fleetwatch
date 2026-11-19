@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""fleetwatch - DERIVE what the agent has running on its clusters, and what watches it.
+
+  fleetwatch              every cluster where this agent has a box
+  fleetwatch SESSION      only that session's work and watchers
+  fleetwatch --json       machine-readable
+
+Two kinds of work, both derived from the cluster, never from a record:
+
+  jobs    Slurm jobs whose workdir is in the agent's box or a writable folder
+  builds  processes in the box on a login node running for MIN_BUILD seconds or
+          more (on the CCAD clusters software is built on the login node, and
+          jobs only run it); one row per process tree
+
+The session a piece of work belongs to is derived too: the first folder under the
+box, since each session works in box/<session>/. Work elsewhere in the box, or in
+a writable folder, is UNATTRIBUTED, never guessed.
+
+Watchers are the registrations fleetregister made, judged by the kernel (is the
+local pid alive, with the same start time?) and by the cluster (is the target
+still live?). So it reports, per cluster:
+
+  live work with no watcher     the case no ledger can catch: you cannot record
+                                the monitor you forgot to create
+  a watcher that DIED           its pid is gone while its target is live
+  a watcher on finished work    alive, but its target ended: it may never exit
+  finished                      watcher gone and target ended: the normal end;
+                                clear it once the result has been read
+  a cluster it could not ask    is NOT "nothing running": nothing about that
+                                cluster can be trusted, and it says so
+
+The question goes through `ssh <cluster> puerta-estado` (see fleet/clusters.py),
+which needs the agent's key unlocked.
+"""
+import getpass, glob, json, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from fleet import config as fc
+from fleet import clusters as fcl
+from fleet.procs import alive
+
+MIN_BUILD = 300   # seconds: shorter-lived processes in the box are commands, not builds
+
+
+def registrations(cfg):
+    """Every registration fleetregister wrote, with `_alive` (the local watcher) set."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(fc.state_dir(cfg), "watchers", "*.json"))):
+        try:
+            with open(path) as f:
+                r = json.load(f)
+        except (OSError, ValueError):
+            out.append({"_file": path, "_bad": True})
+            continue
+        # no cluster, target or start time: written by an older fleetregister, or
+        # by hand. Unverifiable, so it reads as DEAD, the direction of alarm.
+        r["_file"] = path
+        r["_alive"] = bool(r.get("cluster") and r.get("target") and r.get("starttime")
+                           and alive(r.get("pid"), r["starttime"]))
+        out.append(r)
+    return out
+
+
+def root_of(pid, procs):
+    """The top of pid's process tree within the box."""
+    seen = set()
+    while procs[pid]["ppid"] in procs and pid not in seen:
+        seen.add(pid)
+        pid = procs[pid]["ppid"]
+    return pid
+
+
+def builds(state, c, registered=()):
+    """One row per process tree in the box that has run for MIN_BUILD or more, or
+    that holds a registered build. A registration is judged against every process,
+    of any age and anywhere in its tree: reading a young or inner process as gone
+    called a live build finished (mendieta, 2026-10-04)."""
+    procs = {p["pid"]: p for p in state["procs"]}
+    trees = {}
+    for pid in procs:
+        trees.setdefault(root_of(pid, procs), set()).add(pid)
+    rows = []
+    for root, members in trees.items():
+        p = procs[root]
+        if p["seconds"] < MIN_BUILD and not members & set(registered):
+            continue          # a command, not a build
+        rows.append({"kind": "build", "target": f"build:{root}", "pid": root,
+                     "start": p["start"], "host": state["host"], "seconds": p["seconds"],
+                     "where": p["cwd"], "what": p["command"][:60],
+                     "owner": fcl.owner(p["cwd"], c), "watched_by": [],
+                     "members": {m: procs[m]["start"] for m in members}})
+    return sorted(rows, key=lambda r: r["pid"])
+
+
+def jobs(state, c):
+    """One row per array parent."""
+    by = {}
+    for j in state["jobs"]:
+        r = by.setdefault(j["parent"], {"kind": "job", "target": j["parent"], "tasks": 0,
+                                        "states": {}, "reasons": set(), "where": j["workdir"],
+                                        "owner": fcl.owner(j["workdir"], c), "watched_by": []})
+        r["tasks"] += 1
+        r["states"][j["state"]] = r["states"].get(j["state"], 0) + 1
+        r["reasons"].add(j["reason"])
+    for r in by.values():
+        # a held task never starts, so there is nothing to watch until a human
+        # releases it; Dependency, Resources and Priority start on their own
+        r["held"] = bool(r["reasons"]) and all(x in c["held"] for x in r["reasons"])
+        r["what"] = ",".join(f"{k}:{v}" for k, v in sorted(r["states"].items()))
+        r["reasons"] = sorted(r["reasons"])
+    return [by[k] for k in sorted(by)]
+
+
+def judge(regs, rows, state, c):
+    """Attach live watchers to rows; sort the rest into dead, stale and finished."""
+    live = {r["target"]: r for r in rows if r["kind"] == "job"}
+    # a build is found by any process of its tree, matched by pid AND start time
+    member = {(pid, st): r for r in rows if r["kind"] == "build"
+              for pid, st in r["members"].items()}
+    dead, stale, finished = [], [], []
+    for g in regs:
+        t = g["target"]
+        row = live.get(t)
+        if t.startswith("build:"):
+            if g.get("host") != state["host"]:
+                # a cluster may have several login nodes behind one name
+                g["_why"] = (f"it runs on {g.get('host')}; this query reached {state['host']}"
+                             " -- cannot tell")
+                (stale if g["_alive"] else dead).append(g)
+                continue
+            # a pid reused by another process does not match: the build ended
+            row = member.get((int(t.split(":", 1)[1]), g.get("remote_start")))
+        if row is not None:
+            if g["_alive"]:
+                row["watched_by"].append(g["session"])
+            else:
+                g["_why"] = "its target is STILL LIVE"
+                dead.append(g)
+            continue
+        # the target is not live
+        if not t.startswith("build:"):
+            st = state["finals"].get(t)
+            if not st:
+                g["_why"] = "not in the queue, and sacct gives no final state for it"
+                (stale if g["_alive"] else dead).append(g)
+                continue
+            if not all(x in fcl.TERMINAL for x in st):
+                g["_why"] = "not in the queue, yet sacct says " + ",".join(sorted(st))
+                (stale if g["_alive"] else dead).append(g)
+                continue
+            g["_ended"] = ",".join(sorted(st))
+        else:
+            g["_ended"] = "process gone (its log has the result)"
+        (stale if g["_alive"] else finished).append(g)
+    return dead, stale, finished
+
+
+def survey(cfg, agent, only=None, query=fcl.query):
+    """Everything fleetwatch reports, per cluster."""
+    regs = registrations(cfg)
+    bad = [r["_file"] for r in regs if r.get("_bad")]
+    regs = [r for r in regs if not r.get("_bad")]
+    out = {"agent": agent, "clusters": [], "bad_registrations": bad}
+    names = set()
+    for c in fcl.clusters(cfg, agent):
+        names.add(c["name"])
+        mine = [r for r in regs if r.get("cluster") == c["name"]]
+        state = query(c, sorted({r["target"] for r in mine if r["target"].isdigit()}))
+        sec = {"cluster": c["name"], "ok": state["complete"], "host": state["host"],
+               "error": state.get("error", ""), "timed_out": bool(state.get("timed_out")),
+               "slurm": c["slurm"],
+               "squeue": state["squeue"], "rows": [], "dead": [], "stale": [], "finished": []}
+        if state["complete"]:
+            regd = {int(r["target"].split(":", 1)[1]) for r in mine
+                    if r["target"].startswith("build:") and r["target"][6:].isdigit()}
+            rows = jobs(state, c) + builds(state, c, regd)
+            sec["dead"], sec["stale"], sec["finished"] = judge(mine, rows, state, c)
+            sec["rows"] = rows
+        else:
+            sec["unjudged"] = mine
+        if only:
+            sec["rows"] = [r for r in sec["rows"] if r["owner"] == only or only in r["watched_by"]]
+            for k in ("dead", "stale", "finished", "unjudged"):
+                if k in sec:
+                    sec[k] = [g for g in sec[k] if g.get("session") == only]
+        out["clusters"].append(sec)
+    out["orphans"] = [r for r in regs if r.get("cluster") not in names
+                      and (not only or r.get("session") == only)]
+    return out
+
+
+def say_reg(g):
+    return (f"{g.get('session')} / {g.get('target')} as pid {g.get('pid')}, armed "
+            f"{g.get('armed', '?')}")
+
+
+def report(s):
+    alarms = 0
+    if not s["clusters"]:
+        print(f"no cluster in fleet.toml has a box for {s['agent']}.")
+    for sec in s["clusters"]:
+        print(f"== {sec['cluster']}" + (f"  ({sec['host']})" if sec["host"] else ""))
+        if not sec["ok"]:
+            alarms += 1
+            print(f"!! COULD NOT ASK THE CLUSTER: {sec['error'] or 'no complete report'}")
+            print("   This is NOT \"nothing running\": nothing about this cluster can be")
+            print("   trusted. " + ("The cluster answered slowly: raise query_timeout in its block of"
+                                " fleet.toml if it keeps happening." if sec.get("timed_out")
+                                else "Is the key unlocked (ssh-add -l)?"))
+            for g in sec.get("unjudged", []):
+                print(f"   registered, unjudged: {say_reg(g)}")
+            continue
+        if sec["squeue"] == "failed":
+            alarms += 1
+            print("!! squeue failed there: the jobs below are missing, not absent")
+        rows = sec["rows"]
+        if not rows:
+            print("   nothing running.")
+        for r in rows:
+            who = (", ".join(r["watched_by"]) if r["watched_by"]
+                   else ("held - nothing to watch" if r.get("held") else "*** NOBODY ***"))
+            extra = (f"{r['tasks']} task(s) {r['what']}" if r["kind"] == "job"
+                     else f"{r['seconds'] // 60} min, {r['what']}")
+            print(f"   {r['kind']:<5} {r['target']:<14} {r['owner'] or 'UNATTRIBUTED':<16} "
+                  f"{extra}  -> {who}")
+        un = [r for r in rows if not r["watched_by"] and not r.get("held")]
+        if un:
+            alarms += 1
+            print("!! LIVE WORK WITH NO WATCHER -- you cannot record the monitor you forgot")
+            print("   to create. Its session arms one and registers it:")
+            for r in un:
+                print(f"   fleetregister {r['owner'] or '<session>'} {sec['cluster']} "
+                      f"{r['target']} <pid of the watcher>      # {r['where']}")
+        ua = [r for r in rows if not r["owner"]]
+        if ua:
+            alarms += 1
+            print("!! UNATTRIBUTED: work outside box/<session>/ -- whose is it?")
+            for r in ua:
+                print(f"   {r['target']}  {r['where']}")
+        if sec["dead"]:
+            alarms += 1
+            print("!! REGISTERED WATCHER IS DEAD -- its pid is gone:")
+            for g in sec["dead"]:
+                print(f"   {say_reg(g)}\n      {g.get('_why', '')}")
+        if sec["stale"]:
+            alarms += 1
+            print("!! WATCHER ON WORK THAT IS NOT LIVE -- it may never exit:")
+            for g in sec["stale"]:
+                print(f"   {say_reg(g)}\n      {g.get('_why') or g.get('_ended', '')}")
+        for g in sec["finished"]:
+            print(f"   finished: {say_reg(g)}: {g['_ended']}")
+            print(f"      once the result is read: fleetregister --clear {g['session']} "
+                  f"{sec['cluster']} {g['target']}")
+    for g in s["orphans"]:
+        alarms += 1
+        print(f"!! registration for a cluster with no box for {s['agent']}: {g['_file']}")
+    for f in s["bad_registrations"]:
+        alarms += 1
+        print(f"!! unreadable registration: {f}")
+    if not alarms and s["clusters"]:
+        print("\nEvery cluster answered, all live work is watched, every watcher has live")
+        print("work, and all of it belongs to a session.")
+    return alarms
+
+
+def main(argv=None, query=fcl.query):
+    a = list(sys.argv[1:] if argv is None else argv)
+    only = next((x for x in a if not x.startswith("-")), None)
+    s = survey(fc.load(), getpass.getuser(), only, query)
+    if "--json" in a:
+        for sec in s["clusters"]:
+            for r in sec["rows"]:
+                r.pop("members", None)
+        print(json.dumps(s, indent=1, default=str))
+        return 0
+    return 1 if report(s) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

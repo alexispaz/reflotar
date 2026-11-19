@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""add-cluster - give an agent its box on a cluster, from the human's account.
+
+  ./add-cluster CLUSTER AGENT            check the cluster, show the plan
+  ./add-cluster CLUSTER AGENT --go       do it
+  ./add-cluster ... --from ADDRESS       accept the agent's key only from ADDRESS
+
+What the agent may do on the cluster is declared in ONE place, the [cluster.CLUSTER]
+block of the installed fleet.toml (/home/agents/etc/fleet/fleet.toml), and this
+makes the cluster match it: the folders under `writable` become writable in the
+box, and nothing else; Slurm is on where `slurm_in_box` is true. A cluster or agent
+not declared there yet gets its box only, without either, and the block to declare.
+
+Run as the human, from YOUR clone of flota. CLUSTER is the name you
+ssh to (`ssh CLUSTER` must work for you); AGENT is `claude` or `codex`. What docs/clusters.md
+describes step by step, in one go:
+
+  here     the agent's public key, read with `sudo -u AGENT` and checked to be one
+           plain ed25519 key; the address, user and port from YOUR `ssh -G CLUSTER`
+  cluster  user namespaces work (else there is no box: it stops); puerta copied to
+           ~/agents/puerta; the box ~/agents/AGENT; one line in authorized_keys
+           forcing puerta (a timestamped backup first, the agent's old line
+           replaced, never duplicated); ~/agents/escribir-AGENT, leer-AGENT and
+           ~/agents/slurm-AGENT made to match fleet.toml; `puerta AGENT --check`
+  agent    a `Host CLUSTER` block in its ~/.ssh/config, and once the `Host *`
+           block every cluster shares, written with `sudo -u AGENT`; the cluster's
+           host key copied from YOUR known_hosts to the agent's
+  you      if it is not declared yet, the [cluster.CLUSTER] block for fleet.toml
+
+Run it again at any time: what is already in place is left as it is. Nothing the
+agent wrote is ever executed: its key is validated, and its ssh config is only
+rewritten between this tool's own markers.
+"""
+import argparse, base64, os, re, shlex, subprocess, sys, tomllib
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+PUERTA = os.path.join(HERE, "puerta")
+KEY_RE = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,3}")
+def working_agents(path):
+    """The working AI users (not a pensadero) in the installed fleet.toml."""
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+            agents = cfg.get("ai_users") or cfg.get("agents", {})   # [agents]: the old name
+    except OSError:
+        return ()
+    return tuple(u for u, a in agents.items() if not {"pensadero", "maestro"} & set(a.get("roles", [])))
+FLEET_TOML = "/home/agents/etc/fleet/fleet.toml"
+PATH_RE = re.compile(r"/[A-Za-z0-9._/-]+")
+
+COMMON = """Host *
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+    IdentityAgent ~/.ssh/agente.sock
+"""
+
+# Runs on the cluster as the human: bash on stdin, everything else as arguments.
+REMOTE = r'''
+set -euo pipefail
+go=$1 agent=$2 key=$3 from=$4 puerta_b64=$5 escribir=$6 slurm=$7 esperada=$8 leer=$9
+viejas=${10:-}   # the agent's OTHER public keys (blobs, one per line): their lines go
+umask 077
+max=$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 0)
+if [ "$max" -le 0 ] || ! unshare -Urm true 2>/dev/null; then
+  echo "NO BOX: user namespaces are not available on this cluster"; exit 3
+fi
+echo "user namespaces: ok ($(unshare --version | head -1))"
+if command -v sbatch >/dev/null 2>&1; then echo "scheduler: slurm"; else echo "scheduler: none"; fi
+casa=$(readlink -f "$HOME")
+linea="restrict,pty${from:+,from=\"$from\"},command=\"$casa/agents/puerta $agent\" $key $agent"
+echo "box: $casa/agents/$agent"
+if [ -n "$esperada" ] && [ "$esperada" != "$casa/agents/$agent" ]; then
+  echo "BOX MISMATCH: fleet.toml says $esperada"; exit 4
+fi
+# what fleet.toml declares, against what the cluster has now. In your home only
+# ~/agents/compartido, or a folder in it, may be listed: puerta refuses the rest.
+declarado() {   # declarado LIST: its paths, normalized, one per line
+  local d="" e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    e=$(readlink -m "$e")
+    case $e/ in
+      "$casa/agents/compartido"/*) ;;
+      "$casa"/*) echo "NOT ALLOWED: $e (in your home only ~/agents/compartido)"; exit 6 ;;
+    esac
+    d+="$e"$'\n'
+  done <<< "$1"
+  printf '%s' "${d%$'\n'}"
+}
+deseo=$(declarado "$escribir") || { echo "$deseo"; exit 6; }
+deseo_l=$(declarado "$leer") || { echo "$deseo_l"; exit 6; }
+lista=$casa/agents/escribir-$agent
+lista_l=$casa/agents/leer-$agent
+actual=$(cat "$lista" 2>/dev/null || true)
+actual_l=$(cat "$lista_l" 2>/dev/null || true)
+while IFS= read -r e; do [ -n "$e" ] && echo "writable: $e"; done <<< "$deseo"
+while IFS= read -r e; do [ -n "$e" ] && echo "readable: $e"; done <<< "$deseo_l"
+if [ "$deseo" = "$actual" ]; then cambia_lista=0; else cambia_lista=1; fi
+if [ "$deseo_l" = "$actual_l" ]; then cambia_l=0; else cambia_l=1; fi
+if [ -e "$casa/agents/slurm-$agent" ]; then slurm_ahora=on; else slurm_ahora=off; fi
+ak=$casa/.ssh/authorized_keys
+blob=${key#ssh-ed25519 }
+# authorized_keys as it must be: no other line with this key, no line with another
+# key of this agent (an older key would open the account WITHOUT the box), and the
+# agent's one line, through puerta
+quedan() {
+  [ -f "$ak" ] || return 0
+  grep -vF -- "$blob" "$ak" | { if [ -n "$viejas" ]; then grep -vF -f <(printf '%s\n' "$viejas"); else cat; fi; } || true
+}
+ak_nuevo=$(quedan; printf '%s\n' "$linea")
+ak_ahora=$(cat "$ak" 2>/dev/null || true)
+quitadas=$(diff <(printf '%s\n' "$ak_ahora") <(printf '%s\n' "$ak_nuevo") | sed -n 's/^< //p' | grep -vxF -- "$linea" || true)
+sospechosas=$(printf '%s\n' "$ak_nuevo" | grep -E -- " $agent(@[^ ]*)?\$" | grep -vF -- "agents/puerta $agent\"" || true)
+if [ "$go" != 1 ]; then
+  echo "authorized_keys would get: $linea"
+  [ -n "$quitadas" ] && echo "authorized_keys would DROP $(printf '%s\n' "$quitadas" | wc -l) line(s) of this agent's keys, outside the box:" && printf '%s\n' "$quitadas" | awk '{print "    ... " $NF}'
+  [ -n "$sospechosas" ] && echo "!! authorized_keys has lines that name $agent but do not go through puerta (left as they are; check them):" && printf '%s\n' "$sospechosas" | awk '{print "    ... " $NF}'
+  [ $cambia_lista = 1 ] && echo "escribir-$agent: would change from [${actual//$'\n'/, }] to [${deseo//$'\n'/, }]"
+  [ $cambia_l = 1 ] && echo "leer-$agent: would change from [${actual_l//$'\n'/, }] to [${deseo_l//$'\n'/, }]"
+  [ "$slurm" != "$slurm_ahora" ] && echo "slurm: would go from $slurm_ahora to $slurm"
+  exit 0
+fi
+
+mkdir -p "$casa/agents/$agent"; chmod 700 "$casa/agents"
+nuevo=$(printf %s "$puerta_b64" | base64 -d)
+if [ "$(cat "$casa/agents/puerta" 2>/dev/null)" != "$nuevo" ]; then
+  printf '%s\n' "$nuevo" > "$casa/agents/puerta.new"
+  chmod 700 "$casa/agents/puerta.new"; mv "$casa/agents/puerta.new" "$casa/agents/puerta"
+  echo "puerta: installed"
+else
+  echo "puerta: unchanged"
+fi
+
+mkdir -p "$casa/.ssh"; chmod 700 "$casa/.ssh"
+if ! touch "$ak" 2>/dev/null; then
+  echo "AUTHORIZED_KEYS NOT WRITABLE: $ak as $(id -un) ($(ls -ld "$casa/.ssh" "$ak" 2>&1 | awk '{print $1, $3":"$4, $NF}' | tr '\n' ' '))"
+  exit 7
+fi
+if [ "$ak_nuevo" = "$ak_ahora" ]; then
+  echo "authorized_keys: unchanged"
+else
+  cp -p "$ak" "$ak.antes-$(date +%Y%m%d-%H%M%S)"
+  printf '%s\n' "$ak_nuevo" > "$ak.new"
+  chmod 600 "$ak.new"; mv "$ak.new" "$ak"
+  echo "authorized_keys: line for $agent written (backup beside it)"
+  [ -n "$quitadas" ] && echo "authorized_keys: dropped $(printf '%s\n' "$quitadas" | wc -l) line(s) of this agent's keys, outside the box"
+fi
+[ -n "$sospechosas" ] && echo "!! authorized_keys has lines that name $agent but do not go through puerta (left as they are; check them):" && printf '%s\n' "$sospechosas" | awk '{print "    ... " $NF}'
+if [ "$slurm" = on ]; then touch "$casa/agents/slurm-$agent"; else rm -f "$casa/agents/slurm-$agent"; fi
+if [ "$slurm" = on ]; then echo "slurm: on (jobs run outside the box)"; else echo "slurm: off"; fi
+if [ $cambia_lista = 1 ]; then
+  if [ -z "$deseo" ]; then
+    rm -f "$lista"; echo "escribir-$agent: removed (nothing declared)"
+  else
+    while IFS= read -r e; do
+      mkdir -p "$e" 2>/dev/null || { echo "WRITABLE NOT CREATED: $e (does that path exist on this cluster? correct fleet.toml)"; exit 5; }
+    done <<< "$deseo"
+    printf '%s\n' "$deseo" > "$lista"; echo "escribir-$agent: written as declared"
+  fi
+else
+  echo "escribir-$agent: unchanged"
+fi
+if [ $cambia_l = 1 ]; then
+  if [ -z "$deseo_l" ]; then
+    rm -f "$lista_l"; echo "leer-$agent: removed (nothing declared)"
+  else
+    while IFS= read -r e; do
+      mkdir -p "$e" 2>/dev/null || { echo "READABLE NOT CREATED: $e (does that path exist on this cluster? correct fleet.toml)"; exit 5; }
+    done <<< "$deseo_l"
+    printf '%s\n' "$deseo_l" > "$lista_l"; echo "leer-$agent: written as declared"
+  fi
+else
+  echo "leer-$agent: unchanged"
+fi
+echo "checking the box (it walks the filesystems; it may take a minute) ..."
+"$casa/agents/puerta" "$agent" --check || true
+'''
+
+
+def die(msg):
+    sys.exit(f"add-cluster: {msg}")
+
+
+def agent_key(home, as_agent):
+    out = subprocess.run(as_agent + ["cat", f"{home}/.ssh/id_ed25519.pub"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"cannot read {home}/.ssh/id_ed25519.pub: {out.stderr.strip()}\n"
+            f"  make it first, in its session: /usr/bin/ssh-keygen -t ed25519")
+    key = parse_key(out.stdout)
+    # an empty passphrase opens it: any session of the agent would reach the
+    # cluster at any time, not only while the human has unlocked the key
+    open_ = subprocess.run(as_agent + ["/usr/bin/ssh-keygen", "-y", "-P", "",
+                                       "-f", f"{home}/.ssh/id_ed25519"],
+                           capture_output=True, text=True)
+    if open_.returncode == 0:
+        die(f"{home}/.ssh/id_ed25519 has no passphrase. Give it one, in the agent's\n"
+            f"  session: /usr/bin/ssh-keygen -p -f ~/.ssh/id_ed25519")
+    return key
+
+
+def other_keys(home, key, as_agent):
+    """The blobs of the agent's other public keys (~/.ssh/*.pub): a line of the
+    cluster's authorized_keys with one of them opens your account without the box."""
+    out = subprocess.run(as_agent + ["sh", "-c", f"cat {shlex.quote(home)}/.ssh/*.pub 2>/dev/null"],
+                         capture_output=True, text=True, cwd="/").stdout
+    blob = key.split()[1]
+    return sorted({p[1] for p in (l.split() for l in out.splitlines())
+                   if len(p) >= 2 and p[0].startswith(("ssh-", "ecdsa-", "sk-"))
+                   and re.fullmatch(r"[A-Za-z0-9+/=]+", p[1]) and p[1] != blob})
+
+
+def parse_key(text):
+    """The `ssh-ed25519 BLOB` of a .pub file: one line, one key, nothing else. The
+    file is the agent's, so options or a second key in it must not reach the
+    cluster's authorized_keys."""
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) != 1:
+        die("the public key file must hold exactly one line")
+    m = KEY_RE.match(lines[0])
+    if not m:
+        die("the public key is not a plain ed25519 key")
+    return m.group(0)
+
+
+def ssh_target(cluster, ssh):
+    out = subprocess.run(ssh + ["-G", cluster], capture_output=True, text=True)
+    if out.returncode != 0:
+        die(f"ssh -G {cluster}: {out.stderr.strip()}")
+    conf = dict(l.split(" ", 1) for l in out.stdout.splitlines() if " " in l)
+    return conf["hostname"], conf["user"], conf.get("port", "22")
+
+
+def host_block(cluster, hostname, user, port, vpn=None):
+    """The agent's Host block. With vpn (an interface name or glob, `ppp*`), a Match
+    that makes ssh fail on this machine, before a single packet, while that interface
+    does not exist: with the VPN down a cluster's name may still resolve to a private
+    address that the local network routes elsewhere (a watcher's retries went out by
+    the local network to someone else's machine, every 10 minutes, and its admins
+    blocked this machine, 2026-11-18)."""
+    port_line = f"    Port {port}\n" if port != "22" else ""
+    block = f"Host {cluster}\n    HostName {hostname}\n    User {user}\n{port_line}"
+    if vpn:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\*?", vpn):
+            die(f"vpn = {vpn!r}: an interface name, or a prefix ending in * (ppp*)")
+        block += (f"Match originalhost {cluster} !exec \"ls -d /sys/class/net/{vpn} >/dev/null 2>&1\"\n"
+                  f"    ProxyCommand sh -c 'echo \"flota: la VPN de {cluster} ({vpn}) no esta levantada: "
+                  f"no me conecto\" >&2; exit 1'\n")
+    return block
+
+
+def merge_config(text, name, block):
+    """text with the block between this tool's markers for `name` put at the TOP of
+    the file, replacing any earlier copy. ssh keeps the first value it finds for each
+    option, so a block of this tool below one written by hand loses to it (helvetios,
+    2026-10: a hand-written Host block sent ssh to an agent socket with no key, and
+    the agent got "Permission denied"). Everything else in the file is kept as is."""
+    begin, end = f"# >>> add-cluster: {name}", f"# <<< add-cluster: {name}"
+    new = f"{begin}\n{block}{end}\n"
+    pat = re.compile(re.escape(begin) + r"\n.*?" + re.escape(end) + r"\n*", re.S)
+    rest = pat.sub("", text, count=1)
+    return new + ("\n" + rest if rest.strip() else "")
+
+
+def config_wrong(ssh_g, home, hostname, user, port):
+    """What `ssh -G <cluster>`, run as the agent, says ssh will really use, against
+    what this tool wrote: a list of (option, effective, expected); empty if all match."""
+    conf = {}
+    for line in ssh_g.splitlines():
+        k, _, v = line.partition(" ")
+        conf.setdefault(k.lower(), []).append(v.strip())
+    def norm(v):
+        return v.replace("~", home, 1) if v.startswith("~") else v
+    want = {"hostname": hostname, "user": user, "port": port,
+            "identityagent": f"{home}/.ssh/agente.sock", "identitiesonly": "yes",
+            "identityfile": f"{home}/.ssh/id_ed25519"}
+    wrong = []
+    for k, v in want.items():
+        got = [norm(x) for x in conf.get(k, [])]
+        if (got[:1] if k == "identityfile" else got[-1:]) != [v]:
+            wrong.append((k, ", ".join(got) or "(none)", v))
+    return wrong
+
+
+def check_config(cluster, home, hostname, user, port, as_agent, go):
+    """Ask ssh itself what the agent's ssh will use for the cluster."""
+    # -F: as the fleet's ssh runs it (herramientas/bin/ssh), the agent's own file only
+    r = subprocess.run(as_agent + ["ssh", "-F", f"{home}/.ssh/config", "-G", cluster],
+                       capture_output=True, text=True, cwd="/")
+    if r.returncode != 0:
+        print(f"!! ssh -G {cluster} as the agent failed: {r.stderr.strip()}")
+        return False
+    wrong = config_wrong(r.stdout, home, hostname, user, port)
+    if not wrong:
+        print(f"ssh -G {cluster}: the agent's ssh uses this configuration")
+        return True
+    print(f"!! ssh -G {cluster}: the agent's ssh {'uses' if go else 'uses today'}, NOT what this tool writes:")
+    for k, got, want in wrong:
+        print(f"     {k}: {got}   (expected {want})")
+    print(f"   Something in {home}/.ssh/config, or in /etc/ssh/ssh_config, sets these first.")
+    return False
+
+
+def host_key(hostname, port, home, as_agent, go, mine=None):
+    """Copy the cluster's host key from YOUR known_hosts to the agent's, so the agent
+    knows the server by the key you already verified, and never accepts one blind.
+    Without it, the agent's ssh fails with "Host key verification failed" (helvetios,
+    2026-10-04)."""
+    name = hostname if port == "22" else f"[{hostname}]:{port}"
+    found = subprocess.run(["ssh-keygen", "-F", name] + (["-f", mine] if mine else []),
+                           capture_output=True, text=True)
+    lines = [l for l in found.stdout.splitlines() if l.strip() and not l.startswith("#")]
+    path = f"{home}/.ssh/known_hosts"
+    if not lines:
+        print(f"!! no key for {name} in your known_hosts: ssh to it once yourself, check "
+              "its fingerprint, and run this again")
+        return
+    has = subprocess.run(as_agent + ["ssh-keygen", "-F", name, "-f", path],
+                         capture_output=True, text=True)
+    if has.returncode == 0 and has.stdout.strip():
+        print(f"{path}: knows {name}")
+        return
+    print(f"{path}: {'adding' if go else 'would add'} the host key of {name}, from yours")
+    if go:
+        r = subprocess.run(as_agent + ["sh", "-c", f"umask 077; cat >> {shlex.quote(path)}"],
+                           input="\n".join(lines) + "\n", text=True)
+        if r.returncode != 0:
+            die(f"could not write {path}")
+
+
+def update_agent_config(home, cluster, block, as_agent, go):
+    path = f"{home}/.ssh/config"
+    cur = subprocess.run(as_agent + ["cat", path], capture_output=True, text=True)
+    text = cur.stdout if cur.returncode == 0 else ""
+    new = merge_config(merge_config(text, cluster, block), "every cluster", COMMON)
+    if new == text:
+        print(f"{path}: unchanged")
+        return False
+    print(f"{path}: {'written' if go else 'would be written'}:\n")
+    print("    " + new.replace("\n", "\n    ").rstrip())
+    if go:
+        write = (f"umask 077; cat > {shlex.quote(path)}.new && "
+                 f"mv {shlex.quote(path)}.new {shlex.quote(path)}")
+        r = subprocess.run(as_agent + ["sh", "-c", write], input=new, text=True)
+        if r.returncode != 0:
+            die(f"could not write {path}")
+    return True
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cluster")
+    ap.add_argument("agent", help="a working agent of fleet.toml")
+    ap.add_argument("--go", action="store_true")
+    ap.add_argument("--from", dest="from_", default="", metavar="ADDRESS")
+    ap.add_argument("--fleet-toml", default=FLEET_TOML, help=argparse.SUPPRESS)   # tests
+    # tests: stand-ins for `ssh` and `sudo -u AGENT`
+    ap.add_argument("--ssh", default="ssh", help=argparse.SUPPRESS)
+    ap.add_argument("--as-agent", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--agent-home", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--my-known-hosts", default=None, help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    conocidos = working_agents(args.fleet_toml)
+    if conocidos and args.agent not in conocidos:
+        die(f"{args.agent} is not a working agent in {args.fleet_toml} ({', '.join(conocidos)})")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.cluster):
+        die("a cluster name is letters, digits, '.', '_' and '-'")
+    if args.from_ and not re.fullmatch(r"[A-Za-z0-9.:/*?,!-]+", args.from_):
+        die("--from takes an address or pattern, as authorized_keys from= does")
+
+    try:
+        with open(args.fleet_toml, "rb") as f:
+            bloque = tomllib.load(f).get("cluster", {}).get(args.cluster)
+    except OSError as e:
+        die(f"cannot read {args.fleet_toml}: {e.strerror} (run the planner first)")
+    declarado = bool(bloque) and args.agent in bloque.get("box", {})
+    if declarado:
+        esperada = bloque["box"][args.agent]
+        escribir = list(bloque.get("writable", {}).get(args.agent, []))
+        leer = list(bloque.get("readable", {}).get(args.agent, []))
+        slurm = "on" if bloque.get("slurm_in_box") else "off"
+    else:
+        esperada, escribir, leer, slurm = "", [], [], "off"
+    for e in escribir + leer:
+        if not PATH_RE.fullmatch(e) or "/../" in e + "/":
+            die(f"fleet.toml: writable takes absolute paths of letters, digits, '.', '_', '-': {e}")
+    ssh = shlex.split(args.ssh)
+    as_agent = shlex.split(args.as_agent) if args.as_agent else ["sudo", "-u", args.agent]
+    home = args.agent_home or f"/home/{args.agent}"
+    key = agent_key(home, as_agent)
+    hostname, user, port = ssh_target(args.cluster, ssh)
+    with open(PUERTA, "rb") as f:
+        puerta = base64.b64encode(f.read()).decode()
+
+    print(f"cluster : {args.cluster} ({user}@{hostname}:{port})")
+    print(f"agent   : {args.agent}, key {key[:28]}...")
+    print("MODE    : " + ("DOING IT" if args.go else "plan only (--go to apply)") + "\n")
+    remote = ssh + [args.cluster, "bash", "-s", "--",
+                    *map(shlex.quote, ["1" if args.go else "0", args.agent, key,
+                                       args.from_, puerta, "\n".join(escribir),
+                                       slurm, esperada, "\n".join(leer),
+                                       "\n".join(other_keys(home, key, as_agent))])]
+    r = subprocess.run(remote, input=REMOTE, text=True, stdout=subprocess.PIPE)
+    print(r.stdout, end="")
+    if r.returncode == 3:
+        return 3
+    if r.returncode == 4:
+        die("the box in fleet.toml is not where the cluster puts it; correct fleet.toml")
+    if r.returncode == 6:
+        die(f"fleet.toml declares, for {args.cluster}, a folder in your home outside "
+            "~/agents/compartido; puerta would refuse it")
+    if r.returncode == 5:
+        die(f"a writable folder declared for {args.cluster} cannot be created there; "
+            "correct its block in fleet.toml")
+    if r.returncode == 7:
+        die(f"{args.cluster}: the account cannot write its own ~/.ssh/authorized_keys (above). "
+            "As root there: chown -R <user>: ~<user>/.ssh; chmod 700 ~<user>/.ssh; "
+            "chmod 600 ~<user>/.ssh/authorized_keys")
+    if r.returncode != 0:
+        die(f"the cluster side failed (exit {r.returncode})")
+    sched = re.search(r"^scheduler: (\w+)$", r.stdout, re.M)
+    sched = sched.group(1) if sched else "slurm"
+    box = re.search(r"^box: (.+)$", r.stdout, re.M).group(1)
+    print()
+    cambia = update_agent_config(home, args.cluster,
+                                 host_block(args.cluster, hostname, user, port,
+                                            (bloque or {}).get("vpn")),
+                                 as_agent, args.go)
+    host_key(hostname, port, home, as_agent, args.go, args.my_known_hosts)
+    # with a plan only, ssh -G can only judge a configuration already in place
+    if (args.go or not cambia) and not check_config(args.cluster, home, hostname, user, port, as_agent, args.go) and args.go:
+        die(f"the agent's ssh does not use the block for {args.cluster}: fix {home}/.ssh/config "
+            "as the agent, and run this again")
+    if declarado:
+        if bloque.get("user") and bloque["user"] != user:
+            print(f"\n!! fleet.toml says user {bloque['user']}, your ssh logs in as {user}")
+        print(f"\nThe cluster matches [cluster.{args.cluster}] of {args.fleet_toml}."
+              if args.go else "")
+        return 0
+    print(f"""
+{args.agent} is not declared on {args.cluster} in {args.fleet_toml}: it got its box
+only, with no writable folders and no Slurm. Declare it in fleet/fleet.toml of
+your clone (if the block exists, add {args.agent} to its `box`), commit, run the
+planner, then run this again to apply `writable` and `slurm_in_box`:
+
+    [cluster.{args.cluster}]
+    user         = "{user}"
+    scheduler    = "{sched}"
+    box          = {{ {args.agent} = "{box}" }}
+    slurm_in_box = false
+    # writable   = {{ {args.agent} = ["/path/to/a/shared/folder"] }}""")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

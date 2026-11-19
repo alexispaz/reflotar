@@ -1,0 +1,20 @@
+flota is distributed under the MIT License (see LICENSE).
+
+Parts of it derive from fleet, by Cameron F. Abrams, MIT License,
+https://github.com/cameronabrams/fleet :
+
+- herramientas/fleet/ (the Python package: config, identity, procs, transcripts)
+- herramientas/bin/fleetlog, fleetwatch, fleetregister, fleetcontext
+- herramientas/install
+- reglas/conventions.md and reglas/conventions-codex.md, rules 1 to 7, adapted from
+  examples/conventions.example.md
+- roles/*.md, whose layout follows examples/brief.example.md
+
+They have been changed since. Everything else (the planner and installer, the
+cluster box and add-cluster, buzon, entregar-repo, clonar.py, flota, the rules from 8
+on, the roles' content, the skills) was written for this fleet by S. Alexis Paz and
+the fleet's agents.
+
+reflotar is a copy of flota, shared by S. Alexis Paz: what was particular to the
+group that runs it (skills to reach its computers, memberships, its decision log)
+was left out, and the rest is as it was.

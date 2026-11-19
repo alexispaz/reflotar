@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""fleetregister - a watcher registers what it watches, on which cluster, at arm time.
+
+  fleetregister SESSION CLUSTER JOB PID [NOTE]        a Slurm job (its array parent)
+  fleetregister SESSION CLUSTER JOBS PID [NOTE]       many jobs one loop watches, as
+                                                      432177-432271 or 1,2,5: one
+                                                      query to the cluster for all
+  fleetregister SESSION CLUSTER build:RPID PID [NOTE] a build on the login node,
+                                                      pid RPID there
+  fleetregister --clear SESSION CLUSTER TARGET        once the watcher has ended, or
+                                                      its target has
+  fleetregister --clear-ended SESSION                 every registration of SESSION
+                                                      whose target ended, one ssh
+                                                      per cluster
+
+PID is the LOCAL watcher (the polling loop). fleetwatch reports a target watched
+iff a registered pid is alive with the same start time, and reads a registration
+whose pid is gone as a watcher that DIED, unless the cluster shows its target
+ended. A registration is not a ledger: it claims {pid, target}, and the kernel and
+the scheduler falsify it.
+
+The cluster is part of the identity: job ids of different clusters collide. Before
+registering, the target is checked on the cluster (puerta-estado): a job must be
+the agent's and in the queue; a build must be one of the agent's processes in its
+box, and is recorded with its login node and start time, because pids are reused
+and a cluster may have several login nodes. Nothing unverifiable is registered.
+
+--clear always removes a registration whose watcher died, even when a live loop
+watches the same target; it refuses only while a registered watcher is alive AND its
+target is live, or the cluster cannot tell: that would make live work read UNWATCHED while it is being
+watched. One loop may watch many jobs; when some end, their registrations go while
+the loop goes on (coord, 2026-10-05: 39 stale entries on mendieta otherwise).
+"""
+import datetime, getpass, glob, json, os, re, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from fleet import config as fc
+from fleet import clusters as fcl
+from fleet.procs import alive, starttime
+
+NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+JOBS_RE = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
+MAX_JOBS = 10000
+
+
+def expand(spec):
+    """432177-432271 or 1,2,5 (or both): the job ids, in order, each once."""
+    ids = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if hi < lo or hi - lo >= MAX_JOBS:
+            die(f"{part}: a range goes up, and holds at most {MAX_JOBS} jobs", 2)
+        ids += [str(i) for i in range(lo, hi + 1)]
+    ids = list(dict.fromkeys(ids))
+    if len(ids) > MAX_JOBS:
+        die(f"at most {MAX_JOBS} jobs per call", 2)
+    return ids
+
+
+def die(msg, code=1):
+    print(f"fleetregister: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def watchdir(cfg):
+    return os.path.join(fc.state_dir(cfg), "watchers")
+
+
+def target_key(target):
+    """The file-name form of a target: the job id, or build-<rpid>."""
+    return target.replace(":", "-")
+
+
+def find_cluster(cfg, name, agent):
+    for c in fcl.clusters(cfg, agent):
+        if c["name"] == name:
+            return c
+    die(f"no cluster {name!r} with a box for {agent} in fleet.toml")
+
+
+def verify(c, target, query):
+    """What the cluster says about the target: (extra fields for the record) or die."""
+    if target.startswith("build:"):
+        rpid = target.split(":", 1)[1]
+        if not rpid.isdigit():
+            die("a build is build:<pid on the login node>")
+        r = query(c)
+        if not r["complete"]:
+            die(f"cannot reach {c['name']} to check the build ({r.get('error', '')})")
+        p = next((p for p in r["procs"] if str(p["pid"]) == rpid), None)
+        if p is None:
+            die(f"no process {rpid} of yours in the box on {c['name']} ({r['host']})")
+        return {"host": r["host"], "remote_start": p["start"], "cwd": p["cwd"],
+                "command": p["command"]}
+    if not target.isdigit():
+        die("a job is its array parent id, digits only (123456, not 123456_4)")
+    r = query(c)
+    if not r["complete"]:
+        die(f"cannot reach {c['name']} to check the job ({r.get('error', '')})")
+    j = next((j for j in r["jobs"] if j["parent"] == target), None)
+    if j is None:
+        die(f"job {target} on {c['name']} is not one of yours in the queue")
+    return {"workdir": j["workdir"]}
+
+
+def write(cfg, rec):
+    d = watchdir(cfg)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{rec['session']}-{rec['cluster']}-{target_key(rec['target'])}-{rec['pid']}.json")
+    with open(path, "w") as f:
+        json.dump(rec, f)
+        f.write("\n")
+
+
+def base(session, cname, target, pid, st, note):
+    return {"session": session, "cluster": cname, "target": target, "pid": pid,
+            "starttime": st, "armed": datetime.datetime.now().astimezone().isoformat(),
+            "note": note}
+
+
+def register(cfg, session, cname, target, pid, note, agent, query):
+    c = find_cluster(cfg, cname, agent)
+    st = starttime(pid)
+    if not st:
+        die(f"pid {pid} not running -- nothing to register")
+    rec = base(session, cname, target, pid, st, note)
+    rec.update(verify(c, target, query))
+    write(cfg, rec)
+    print(f"registered: {session} watching {target} on {cname} as pid {pid}")
+
+
+def register_many(cfg, session, cname, ids, pid, note, agent, query):
+    """Many jobs of one loop, checked with one query. Each job the cluster shows queued
+    and yours is registered; the rest are named and the exit status is 1."""
+    c = find_cluster(cfg, cname, agent)
+    st = starttime(pid)
+    if not st:
+        die(f"pid {pid} not running -- nothing to register")
+    r = query(c, ids)
+    if not r["complete"]:
+        die(f"cannot reach {c['name']} to check the jobs ({r.get('error', '')})")
+    queued = {j["parent"]: j for j in r["jobs"]}
+    missing = [i for i in ids if i not in queued]
+    for i in ids:
+        if i in queued:
+            rec = base(session, cname, i, pid, st, note)
+            rec["workdir"] = queued[i]["workdir"]
+            write(cfg, rec)
+    print(f"registered: {session} watching {len(ids) - len(missing)} job(s) on {cname} as pid {pid}")
+    if missing:
+        die(f"not yours in the queue on {cname}, not registered: {', '.join(missing)}")
+
+
+def load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def clear(cfg, session, cname, target, agent, query):
+    pattern = os.path.join(watchdir(cfg), f"{session}-{cname}-{target_key(target)}-*.json")
+    paths = glob.glob(pattern)
+    if not paths:
+        die(f"no registration for {session} / {target} on {cname}")
+    # a registration whose watcher died goes first, always: a live re-armed loop on the
+    # same target must not keep it (2026-10-21: 8 dead entries stayed)
+    vivos = []
+    for path in paths:
+        r = load(path)
+        if r.get("pid") and r.get("starttime") and alive(r["pid"], r["starttime"]):
+            vivos.append((path, r))
+        else:
+            os.remove(path)
+            print(f"cleared (its watcher had died): {path}")
+    state = None
+    for path, r in vivos:
+        if state is None:
+            c = find_cluster(cfg, cname, agent)
+            state = query(c, [target] if target.isdigit() else [])
+        e = fcl.ended(r, state)
+        if e is not True:
+            die(f"pid {r['pid']} still watches {target}, and {cname} "
+                + ("shows it live" if e is False else "cannot tell whether it ended")
+                + f"; not clearing {path}")
+        os.remove(path)
+        print(f"cleared: {path}")
+
+
+def clear_ended(cfg, session, agent, query):
+    """Every registration of SESSION whose target the cluster shows ended."""
+    regs = {}
+    for path in glob.glob(os.path.join(watchdir(cfg), f"{session}-*.json")):
+        r = load(path)
+        if r.get("session") == session and r.get("cluster"):
+            regs.setdefault(r["cluster"], []).append((path, r))
+    if not regs:
+        die(f"no registrations for {session}")
+    n = kept = 0
+    for c in fcl.clusters(cfg, agent):
+        mine = regs.pop(c["name"], [])
+        if not mine:
+            continue
+        state = query(c, sorted({str(r["target"]) for _, r in mine if str(r["target"]).isdigit()}))
+        if not state["complete"]:
+            print(f"{c['name']}: cannot ask ({state.get('error', '')}); nothing cleared there")
+            kept += len(mine)
+            continue
+        for path, r in mine:
+            if fcl.ended(r, state) is True:
+                os.remove(path)
+                n += 1
+            else:
+                kept += 1
+    for name, rest in regs.items():
+        print(f"{name}: no box for {agent} there; {len(rest)} registration(s) left alone")
+        kept += len(rest)
+    print(f"cleared {n} registration(s) of ended work; {kept} kept")
+
+
+def main(argv=None, query=fcl.query):
+    a = list(sys.argv[1:] if argv is None else argv)
+    cfg = fc.load()
+    agent = getpass.getuser()
+    if a[:1] == ["--clear-ended"]:
+        if len(a) != 2 or not NAME_RE.fullmatch(a[1]):
+            die("usage: fleetregister --clear-ended SESSION", 2)
+        return clear_ended(cfg, a[1], agent, query)
+    if a[:1] == ["--clear"]:
+        if len(a) != 4:
+            die("usage: fleetregister --clear SESSION CLUSTER TARGET", 2)
+        _, session, cname, target = a
+        if not (NAME_RE.fullmatch(session) and NAME_RE.fullmatch(cname)):
+            die("session and cluster are letters, digits, '.', '_' and '-'", 2)
+        return clear(cfg, session, cname, target, agent, query)
+    if len(a) not in (4, 5):
+        die("usage: fleetregister SESSION CLUSTER JOB|JOBS|build:RPID PID [NOTE]", 2)
+    session, cname, target, pid = a[:4]
+    if not (NAME_RE.fullmatch(session) and NAME_RE.fullmatch(cname)):
+        die("session and cluster are letters, digits, '.', '_' and '-'", 2)
+    if not pid.isdigit():
+        die("PID is the local watcher's process id", 2)
+    if not target.isdigit() and JOBS_RE.fullmatch(target):
+        return register_many(cfg, session, cname, expand(target), int(pid),
+                             a[4] if len(a) == 5 else "", agent, query)
+    register(cfg, session, cname, target, int(pid), a[4] if len(a) == 5 else "", agent, query)
+
+
+if __name__ == "__main__":
+    main()

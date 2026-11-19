@@ -1,0 +1,473 @@
+import json, os, tempfile, unittest
+from unittest import mock
+from tests.support import FakeConfig, load_tool
+
+class Log(unittest.TestCase):
+    def setUp(self):
+        self.cfg = FakeConfig()
+        self.log = load_tool("fleetlog")
+        self.tmp = tempfile.TemporaryDirectory()
+        # no manifest in the fake state dir, so names pass through un-mapped
+        self.p = [mock.patch.object(self.log, "live_map", return_value={}),
+                  mock.patch.object(self.log, "live_dirs", return_value={})]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self.tmp.cleanup(); self.cfg.close()
+
+    def initiative_transcript(self, records):
+        path = os.path.join(self.tmp.name, "i.jsonl")
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return self.log.parse_transcript(path)[2]
+
+    def user(self, text, ts="2026-09-19T10:00:00Z", **kw):
+        return dict({"type": "user", "timestamp": ts, "message": {"content": text}}, **kw)
+
+    def send(self, to, ts="2026-09-19T10:05:00Z", body="hi"):
+        return {"type": "assistant", "timestamp": ts,
+                "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                         "input": {"to": to, "message": body}}]}}
+
+    def envelope(self, sender, body="have a look"):
+        return (f'<cross-session-message from="uds:/run/x/1.sock" from-name="{sender}">'
+                f'{body}</cross-session-message>')
+
+    def labels(self, records):
+        return [e.get("label") or self.log.label_send(e.get("trigger"), e["peer"], {})
+                for e in self.initiative_transcript(records) if e["dir"] == "out"]
+
+    def test_a_prompt_naming_the_recipient_is_instructed(self):
+        self.assertEqual(self.labels([self.user("ask beta to rebuild the module"),
+                                      self.send("beta")]), ["instructed"])
+
+    def test_a_prompt_about_something_else_is_volunteered(self):
+        self.assertEqual(self.labels([self.user("what is the state of the sweep?"),
+                                      self.send("beta")]), ["volunteered"])
+
+    def test_answering_the_peer_who_wrote_is_reply_and_another_peer_is_onward(self):
+        recs = [self.user(self.envelope("beta"), isMeta=True), self.send("beta")]
+        self.assertEqual(self.labels(recs), ["reply"])
+        recs = [self.user(self.envelope("beta"), isMeta=True), self.send("gamma")]
+        self.assertEqual(self.labels(recs), ["onward"])
+
+    def test_trap_a_tool_result_is_a_user_record_but_not_a_turn(self):
+        # counting one as a turn reset the trigger on every tool call: 93% "auto"
+        tool_result = {"type": "user", "timestamp": "2026-09-19T10:02:00Z",
+                       "message": {"content": [{"type": "tool_result", "content": "ok"}]}}
+        self.assertEqual(self.labels([self.user("ask beta about the module"),
+                                      tool_result, self.send("beta")]), ["instructed"])
+
+    def test_trap_an_incoming_message_is_meta_and_must_not_be_skipped(self):
+        # filtering isMeta records scored peer-triggered sends at exactly 0
+        self.assertEqual(self.labels([self.user(self.envelope("beta"), isMeta=True),
+                                      self.send("beta")]), ["reply"])
+
+    def test_trap_the_same_message_is_written_three_times(self):
+        # attachment + queue-operation + the user record that starts the turn; the
+        # graph keeps one copy, but the trigger must still see the user record
+        env = self.envelope("beta")
+        recs = [{"type": "attachment", "timestamp": "2026-09-19T10:00:00Z",
+                 "message": {"content": env}},
+                {"type": "queue-operation", "timestamp": "2026-09-19T10:00:01Z",
+                 "message": {"content": env}},
+                self.user(env, ts="2026-09-19T10:00:02Z", isMeta=True),
+                self.send("beta")]
+        events = self.initiative_transcript(recs)
+        self.assertEqual(len([e for e in events if e["dir"] == "in"]), 1)   # graph unchanged
+        self.assertEqual(self.labels(recs), ["reply"])
+
+    def test_a_notification_only_turn_is_auto(self):
+        note = self.user("<task-notification>job 1 ended</task-notification>", isMeta=True)
+        self.assertEqual(self.labels([note, self.send("beta")]), ["auto"])
+        self.assertEqual(self.labels([self.send("beta")]), ["auto"])      # nothing before it
+
+    def test_instructed_uses_the_names_a_session_has_answered_to(self):
+        send = self.log.label_send(("human", "ask mirror-depo to check it"), "mirror-repo",
+                                   {"mirror-repo": {"mirror-depo", "mirror-repo"}})
+        self.assertEqual(send, "instructed")
+
+    def test_week_of(self):
+        self.assertEqual(self.log.week_of("2026-09-19T10:00:00Z"), "2026-09-14")
+        self.assertEqual(self.log.week_of("2026-09-14T00:00:00Z"), "2026-09-14")
+        self.assertEqual(self.log.week_of("nonsense"), "????-??-??")
+
+    def test_parse_in_and_out(self):
+        path = os.path.join(self.tmp.name, "t.jsonl")
+        envelope = ('<cross-session-message from="uds:/run/x/1.sock" from-name="beta">'
+                    'Please look at the slug bug\nmore</cross-session-message>')
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "user", "timestamp": "2026-09-13T10:00:00Z",
+                                "message": {"content": "This session is alpha [abc123]"}}) + "\n")
+            f.write(json.dumps({"type": "user", "timestamp": "2026-09-13T10:01:00Z",
+                                "message": {"content": envelope}}) + "\n")
+            f.write(json.dumps({"type": "user", "timestamp": "2026-09-13T10:01:01Z",
+                                "message": {"content": envelope}}) + "\n")   # queued + delivered
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-09-13T10:02:00Z",
+                                "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                            "input": {"to": "beta", "summary": "fixed",
+                                                      "message": "done"}}]}}) + "\n")
+        ident, how, events = self.log.parse_transcript(path)
+        self.assertEqual((ident, how), ("alpha", "own name record"))
+        self.assertEqual([(e["dir"], e["peer"]) for e in events], [("in", "beta"), ("out", "beta")])
+        self.assertEqual(events[0]["subject"], "Please look at the slug bug")
+
+    def test_dedupe_keeps_one_copy_per_message(self):
+        e = {"dir": "out", "from": "a", "to": "b", "ts": "2026-09-13T10:00:00.000Z", "body": "hello"}
+        other_side = dict(e, dir="in", ts="2026-09-13T10:00:03.000Z")    # recipient's copy
+        different = dict(e, body="goodbye")
+        self.assertEqual(len(self.log.dedupe([e, dict(e), other_side, different])), 2)
+
+    def test_canon_strips_ref(self):
+        self.assertEqual(self.log.canon("beta [abc123]"), "beta")
+        self.assertIsNone(self.log.canon(""))
+
+
+class RealShapes(unittest.TestCase):
+    """A message recorded by both ends, in the shapes real transcripts use.
+    The receiver stores it twice (a queue record, and the delivered message with
+    harness text after the closing tag); the sender stores the raw SendMessage
+    text. Reported 2026-09-13: every message was counted twice, because the
+    received body carried the tag's newline, the closing tag and trailing text,
+    so it never matched the sent body. The old test used identical bodies."""
+    def setUp(self):
+        self.cfg = FakeConfig()
+        self.log = load_tool("fleetlog")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.p = [mock.patch.object(self.log, "live_map", return_value={}),
+                  mock.patch.object(self.log, "live_dirs", return_value={}),
+                  mock.patch.object(self.log, "PROJECTS", self.tmp.name)]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self.tmp.cleanup(); self.cfg.close()
+
+    def transcript(self, proj, uuid, records):
+        d = os.path.join(self.tmp.name, proj); os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, uuid + ".jsonl"), "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def exchange(self, body):
+        self.transcript("-a", "sender", [
+            {"type": "user", "message": {"content": "This session is alpha [aaaaaa]"}},
+            {"type": "assistant", "timestamp": "2026-09-13T19:16:00.100Z",
+             "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                          "input": {"to": "beta", "summary": "a summary", "message": body}}]}}])
+        env = ('<cross-session-message from="uds:/run/user/1/cc-socks/9.sock" '
+               'from-name="alpha" from-mode="prompting">\n' + body + '\n</cross-session-message>')
+        self.transcript("-b", "receiver", [
+            {"type": "user", "message": {"content": "This session is beta [bbbbbb]"}},
+            {"type": "queue-operation", "timestamp": "2026-09-13T19:16:01.000Z", "content": env},
+            {"type": "user", "timestamp": "2026-09-13T19:16:03.000Z",
+             "message": {"content": env + "\n\nThis came from another Claude session -- not typed by your user."}}])
+
+    def test_one_message_counts_once(self):
+        self.exchange("PNG crop of the figure is at /tmp/x.png; one-line conclusion follows.")
+        _, edges = self.log.load_all()
+        self.assertEqual([(e["from"], e["to"]) for e in edges], [("alpha", "beta")])
+
+    def test_long_message_counts_once(self):
+        self.exchange("Details: " + "word " * 200)
+        _, edges = self.log.load_all()
+        self.assertEqual(len(edges), 1)
+
+    def test_two_different_messages_count_twice(self):
+        self.exchange("first message, about the slug bug")
+        _, e1 = self.log.load_all()
+        self.transcript("-a", "sender2", [
+            {"type": "user", "message": {"content": "This session is alpha [aaaaaa]"}},
+            {"type": "assistant", "timestamp": "2026-09-13T20:00:00.000Z",
+             "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                          "input": {"to": "beta", "message": "second message, about docs"}}]}}])
+        _, e2 = self.log.load_all()
+        self.assertEqual((len(e1), len(e2)), (1, 2))
+
+
+class Identity(unittest.TestCase):
+    """Whose transcript is this? OBSERVED 2026-09-14: the original coordinator
+    transcript -- agent-name 'coord' throughout -- was reported as another session,
+    because identity came from the FIRST self-report (an old name) and was then
+    mapped through the fleet-wide old-name table, where that name had later
+    belonged to someone else. Names are reused; a transcript's own last name
+    record is what identifies it."""
+    def setUp(self):
+        self.cfg = FakeConfig()
+        self.tmp = tempfile.TemporaryDirectory()
+        json.dump({"sessions": [{"label": "coord", "cwd": "/home/u"},
+                                {"label": "notebook", "cwd": "/home/u/site"},
+                                {"label": "study", "cwd": "/home/u/runs"}]},
+                  open(os.path.join(self.cfg.state, "manifest.json"), "w"))
+        self.log = load_tool("fleetlog")
+        self.p = [mock.patch.object(self.log, "live_map", return_value={}),
+                  mock.patch.object(self.log, "live_dirs", return_value={}),
+                  mock.patch.object(self.log, "PROJECTS", self.tmp.name)]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self.tmp.cleanup(); self.cfg.close()
+
+    def transcript(self, proj, uuid, records):
+        d = os.path.join(self.tmp.name, proj); os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, uuid + ".jsonl")
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return path
+
+    @staticmethod
+    def said(name):
+        return {"type": "user", "message": {"content": f"This session is {name} [abcdef]"}}
+
+    def test_last_agent_name_wins_over_first_self_report(self):
+        # the old name 'x-7e' later belonged to the site session's transcript
+        site = self.transcript("-home-u-site", "site", [self.said("x-7e"), self.said("notebook")])
+        coord = self.transcript("-home-u", "coord", [
+            {"type": "agent-name", "agentName": "coord"}, self.said("x-7e"),
+            {"type": "agent-name", "agentName": "coord"}])
+        # the site transcript is newer, so the old-name table maps x-7e -> notebook
+        os.utime(coord, (1000, 1000)); os.utime(site, (2000, 2000))
+        self.assertEqual(self.log.name_map().get("x-7e"), "notebook")
+        ident, how, _ = self.log.parse_transcript(coord)
+        self.assertEqual(ident, "coord", how)
+
+    def test_renamed_transcript_is_its_latest_name(self):
+        repo = self.transcript("-home-u-repo", "repo", [
+            {"type": "agent-name", "agentName": "study"}, self.said("study"),
+            {"type": "agent-name", "agentName": "repo-now"}])
+        self.assertEqual(self.log.parse_transcript(repo)[0], "repo-now")
+
+    def test_retired_name_goes_to_its_own_directory_owner(self):
+        old = self.transcript("-home-u-runs", "old", [self.said("runs-41")])
+        ident, how, _ = self.log.parse_transcript(old)
+        self.assertEqual(ident, "study")
+        self.assertIn("renamed", how)
+
+    def test_retired_name_renamed_in_a_later_transcript_elsewhere(self):
+        # a session named lit-98 in one directory, later resumed elsewhere and
+        # renamed there; its old transcript belongs to the session it became
+        old = self.transcript("-home-u-sync", "old", [self.said("lit-98")])
+        self.transcript("-home-u-mirror", "new", [self.said("lit-98"),
+                                                  {"type": "agent-name", "agentName": "notebook"}])
+        ident, how, _ = self.log.parse_transcript(old)
+        self.assertEqual(ident, "notebook", how)
+
+    def test_retired_name_with_no_owner_stays_as_written(self):
+        old = self.transcript("-home-u-gone", "old", [{"type": "agent-name", "agentName": "gone-9"}])
+        self.assertEqual(self.log.parse_transcript(old)[0], "gone-9")
+
+
+class RenamedSender(Identity):
+    """A message from a session that has since been renamed. The sender's copy is
+    attributed to the transcript's current name; the receiver's envelope carries
+    the name it had then. Identity fixed without pairing made these two copies
+    disagree and counted each message twice again (measured 2026-09-14,
+    1470 -> 1675 edges)."""
+    def send(self, proj, uuid, name, sent_as, to, body, ts):
+        return self.transcript(proj, uuid, [
+            {"type": "agent-name", "agentName": name},
+            {"type": "assistant", "timestamp": ts,
+             "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                      "input": {"to": to, "message": body}}]}}])
+
+    def receive(self, proj, uuid, name, sender_then, body, ts):
+        env = (f'<cross-session-message from="uds:/run/x/1.sock" from-name="{sender_then}" '
+               f'from-mode="prompting">\n{body}\n</cross-session-message>')
+        return self.transcript(proj, uuid, [
+            {"type": "agent-name", "agentName": name},
+            {"type": "user", "timestamp": ts, "message": {"content": env}}])
+
+    def test_message_from_renamed_sender_counts_once_under_current_name(self):
+        site = self.transcript("-home-u-site", "site", [self.said("x-7e"), self.said("notebook")])
+        coord = self.send("-home-u", "coord", "coord", "x-7e", "study", "please look at runs", "2026-08-20T10:00:00Z")
+        self.receive("-home-u-runs", "runs", "study", "x-7e", "please look at runs", "2026-08-20T10:00:02Z")
+        os.utime(coord, (1000, 1000)); os.utime(site, (2000, 2000))   # x-7e -> notebook in the table
+        _, edges = self.log.load_all()
+        self.assertEqual([(e["from"], e["to"]) for e in edges], [("coord", "study")])
+
+    def test_broadcast_counts_once_per_recipient(self):
+        body = "convention change: see the drop"
+        self.transcript("-home-u", "coord", [
+            {"type": "agent-name", "agentName": "coord"},
+            {"type": "assistant", "timestamp": "2026-09-01T10:00:00Z",
+             "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                      "input": {"to": "notebook", "message": body}},
+                                     {"type": "tool_use", "name": "SendMessage",
+                                      "input": {"to": "study", "message": body}}]}}])
+        self.receive("-home-u-site", "site", "notebook", "coord", body, "2026-09-01T10:00:01Z")
+        self.receive("-home-u-runs", "runs", "study", "coord", body, "2026-09-01T10:00:02Z")
+        _, edges = self.log.load_all()
+        self.assertEqual(sorted((e["from"], e["to"]) for e in edges),
+                         [("coord", "notebook"), ("coord", "study")])
+
+    def test_same_text_days_apart_is_two_messages(self):
+        self.send("-home-u", "coord", "coord", "coord", "study", "status?", "2026-09-01T10:00:00Z")
+        self.receive("-home-u-runs", "runs", "study", "coord", "status?", "2026-09-01T10:00:01Z")
+        self.send("-home-u", "coord2", "coord", "coord", "study", "status?", "2026-09-05T10:00:00Z")
+        self.receive("-home-u-runs", "runs2", "study", "coord", "status?", "2026-09-05T10:00:01Z")
+        _, edges = self.log.load_all()
+        self.assertEqual(len(edges), 2)
+
+    def test_unpaired_copies_days_apart_are_not_merged(self):
+        # a received copy whose sender transcript is gone, and a later send whose
+        # receiver transcript is gone: two messages, not one
+        self.receive("-home-u-runs", "runs", "study", "coord", "status?", "2026-09-01T10:00:01Z")
+        self.send("-home-u", "coord", "coord", "coord", "study", "status?", "2026-09-05T10:00:00Z")
+        _, edges = self.log.load_all()
+        self.assertEqual(len(edges), 2)
+
+    def test_two_senders_same_text_pair_by_sender(self):
+        self.send("-home-u", "coord", "coord", "coord", "study", "ack", "2026-09-01T10:00:00Z")
+        self.send("-home-u-site", "site", "notebook", "notebook", "study", "ack", "2026-09-01T10:00:01Z")
+        self.receive("-home-u-runs", "r1", "study", "coord", "ack", "2026-09-01T10:00:02Z")
+        self.receive("-home-u-runs", "r2", "study", "notebook", "ack", "2026-09-01T10:00:03Z")
+        _, edges = self.log.load_all()
+        self.assertEqual(sorted((e["from"], e["to"]) for e in edges),
+                         [("coord", "study"), ("notebook", "study")])
+
+    # inherited identity tests are run by Identity itself
+    test_last_agent_name_wins_over_first_self_report = None
+    test_renamed_transcript_is_its_latest_name = None
+    test_retired_name_goes_to_its_own_directory_owner = None
+    test_retired_name_with_no_owner_stays_as_written = None
+    test_retired_name_renamed_in_a_later_transcript_elsewhere = None
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SinceHuman(unittest.TestCase):
+    """How many messages a session has exchanged since the human last spoke to it."""
+    def setUp(self):
+        from tests.support import BASE_TOML
+        self.cfg = FakeConfig(BASE_TOML + "\n[messages]\nreport_after = 3\n")
+        self.log = load_tool("fleetlog")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.p = [mock.patch.object(self.log, "live_map", return_value={}),
+                  mock.patch.object(self.log, "live_dirs", return_value={}),
+                  mock.patch.object(self.log, "PROJECTS", self.tmp.name)]
+        for p in self.p:
+            p.start()
+
+    def tearDown(self):
+        for p in self.p:
+            p.stop()
+        self.tmp.cleanup(); self.cfg.close()
+
+    user = Log.user
+    send = Log.send
+    envelope = Log.envelope
+
+    def peer(self, sender, ts):
+        return self.user(self.envelope(sender, body=f"note {ts}"), ts=ts, isMeta=True)
+
+    def transcript(self, records, cwd="/w/coord"):
+        d = os.path.join(self.tmp.name, self.log.project_slug(cwd))
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "s.jsonl")
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        return path
+
+    def test_the_count_restarts_when_the_human_speaks(self):
+        path = self.transcript([
+            self.user("ask beta to build", ts="2026-09-30T10:00:00Z"),
+            self.send("beta", ts="2026-09-30T10:01:00Z"),
+            self.peer("beta", "2026-09-30T10:02:00Z"),
+            self.user("how is it going?", ts="2026-09-30T10:03:00Z"),
+            self.send("beta", ts="2026-09-30T10:04:00Z", body="status?"),
+            self.peer("beta", "2026-09-30T10:05:00Z"),
+            self.peer("gamma", "2026-09-30T10:06:00Z")])
+        last, counts = self.log.since_human(path)
+        self.assertEqual(last, "2026-09-30T10:03:00Z")
+        self.assertEqual(counts, {"beta": [1, 1], "gamma": [0, 1]})
+
+    def test_a_peer_message_does_not_restart_the_count(self):
+        # trap 2 of turn_trigger: an incoming message is a `user` record too
+        path = self.transcript([
+            self.user("go", ts="2026-09-30T10:00:00Z"),
+            self.peer("beta", "2026-09-30T10:01:00Z"),
+            self.send("beta", ts="2026-09-30T10:02:00Z"),
+            self.peer("beta", "2026-09-30T10:03:00Z")])
+        self.assertEqual(self.log.since_human(path)[1], {"beta": [1, 2]})
+
+    def test_an_envelope_quoted_in_a_tool_call_or_its_result_is_not_a_message(self):
+        quote = self.envelope("{sender}")
+        path = self.transcript([
+            self.user("write the fixture", ts="2026-09-30T10:00:00Z"),
+            {"type": "assistant", "timestamp": "2026-09-30T10:01:00Z",
+             "message": {"content": [{"type": "tool_use", "name": "Bash",
+                                      "input": {"command": f"cat > t.py <<EOF\n{quote}\nEOF"}}]}},
+            {"type": "user", "timestamp": "2026-09-30T10:02:00Z",
+             "message": {"content": [{"type": "tool_result", "content": quote}]}}])
+        self.assertEqual(self.log.since_human(path)[1], {})
+
+    def test_an_envelope_with_only_from_names_its_sender(self):
+        path = self.transcript([
+            self.user("go", ts="2026-09-30T10:00:00Z"),
+            self.user('<cross-session-message from="beta">done</cross-session-message>',
+                      ts="2026-09-30T10:01:00Z", isMeta=True)])
+        self.assertEqual(self.log.since_human(path)[1], {"beta": [0, 1]})
+
+    def test_an_idle_subscription_is_not_a_message(self):
+        sub = {"type": "assistant", "timestamp": "2026-09-30T10:01:00Z",
+               "message": {"content": [{"type": "tool_use", "name": "SendMessage",
+                                        "input": {"to": "beta", "message": "",
+                                                  "notify_when_idle": True}}]}}
+        path = self.transcript([self.user("go", ts="2026-09-30T10:00:00Z"), sub])
+        self.assertEqual(self.log.since_human(path)[1], {})
+
+    def run_cmd(self, cwd):
+        args = mock.Mock(dir=cwd, json=True)
+        with mock.patch("sys.stdout") as out:
+            code = self.log.cmd_since_human(args)
+        return code, json.loads("".join(c.args[0] for c in out.write.call_args_list))
+
+    def test_reaching_report_after_exits_3_and_names_the_peer(self):
+        self.transcript([self.user("go", ts="2026-09-30T10:00:00Z"),
+                         self.send("beta", ts="2026-09-30T10:01:00Z"),
+                         self.peer("beta", "2026-09-30T10:02:00Z"),
+                         self.send("beta", ts="2026-09-30T10:03:00Z", body="and?"),
+                         self.peer("gamma", "2026-09-30T10:04:00Z")])
+        code, rep = self.run_cmd("/w/coord")
+        self.assertEqual(code, 3)
+        self.assertEqual(rep["reached"], ["beta"])
+        self.assertEqual(rep["peers"]["gamma"], {"sent": 0, "received": 1})
+
+    def test_below_report_after_exits_0(self):
+        self.transcript([self.user("go", ts="2026-09-30T10:00:00Z"),
+                         self.send("beta", ts="2026-09-30T10:01:00Z")])
+        self.assertEqual(self.run_cmd("/w/coord")[0], 0)
+
+    def test_without_dir_it_reads_the_calling_session_not_the_folder(self):
+        # coord, 2026-10-04: run from another repo's folder, it counted that session
+        mine = self.transcript([self.user("go", ts="2026-09-30T10:00:00Z"),
+                                self.send("beta", ts="2026-09-30T10:01:00Z")], cwd="/w/coord")
+        self.transcript([self.user("go", ts="2026-09-30T10:00:00Z"),
+                         self.send("gamma", ts="2026-09-30T10:01:00Z")], cwd="/w/other")
+        with mock.patch.object(self.log, "calling_session", return_value=(1, "/w/coord")), \
+             mock.patch("fleet.transcripts.uuid_from_descendants", return_value=None), \
+             mock.patch("os.getcwd", return_value="/w/other"):
+            code, rep = self.run_cmd(None)
+        self.assertEqual(rep["transcript"], mine)
+        self.assertEqual(list(rep["peers"]), ["beta"])
+
+    def test_outside_a_session_without_dir_exits_2(self):
+        with mock.patch.object(self.log, "calling_session", return_value=None), \
+             mock.patch("sys.stderr"):
+            self.assertEqual(self.log.cmd_since_human(mock.Mock(dir=None, json=False)), 2)
+
+    def test_no_transcript_for_the_directory_exits_2(self):
+        with mock.patch("sys.stderr"):
+            self.assertEqual(self.log.cmd_since_human(mock.Mock(dir="/w/none", json=False)), 2)

@@ -1,0 +1,2378 @@
+#!/usr/bin/env python3
+"""flota -- what the human can do with the fleet, and what is pending now.
+
+    flota            what is pending now, then the cheat sheet (COMANDOS.md)
+    flota <tema>     only the sections whose title contains <tema> (clusters, repos...)
+    flota arrancar [USUARIO...]
+                     start the fleets (all, or the AI users named): each working
+                     user's cluster key (you type the passphrase), its tmux and its
+                     coord resumed, asked to resume the other sessions; the
+                     pensadero's maestro resumed. You land in the first one
+    Places, as scp writes them: `claude:proyecto_a` is ~claude/work/proyecto_a (a línea of the
+    pensadero: pensadero:lineas/namd), `claude:` or `claude` its whole ~/work; a plain
+    path is yours.
+    As cp does, a destination that is a folder already gets the thing INSIDE it.
+
+    flota pasar . FLOTA  ·  flota pasar FLOTA .
+                     a project, between your ~/agents/<path> and its copy in its one
+                     fleet (a bare fleet name means that same path there): its repos by git (handed
+                     over, or brought with your review; a new one cloned safely), the
+                     rest by rsync, never a file git follows nor over a newer one.
+                     Shows flota estado's comparison, one summary, asks once
+    flota pasar ORIGEN... DESTINO [--arbol RAIZ] [--borrar]
+                     a folder or a file, never a .git, from you to an AI user (`flota
+                     pasar ~/ideas pensadero`), back (`flota pasar pensadero:ideas
+                     ~/agents`), or between them (`flota pasar claude:x pensadero`).
+                     rsync, one way: shows what would change, asks, copies what
+                     changed. Run it again to bring the copy up to date. Deletes
+                     nothing unless --borrar (then the destination ends up as the
+                     origin, and the list shows what goes). Out of the pensadero, to
+                     anyone but you, it asks first. Folders the destination needs
+                     are created (`claude:proyecto/docs/`, with the slash: inside it).
+                     Several origins go inside DESTINO, each by its name; with
+                     --arbol RAIZ each keeps its path under RAIZ (`flota pasar
+                     --arbol ~/gd ~/gd/a/x ~/gd/b/y pensadero:gd` makes gd/a/x, gd/b/y)
+    flota traer USUARIO:REPO         the branches of a repo you have a clone of
+    flota traer [CLON]   bring the agents' new branches into your clones under
+                     ~/agents (or one of them; `.` is the repo you are in): fetch, show each branch's commits
+                     and diff, merge it if you say so (--ff-only); then offer to
+                     hand your main back to the agent. It does not install: if flota
+                     or your configuration changed, it says so
+    flota actualizar     the fleet itself: the architect's branches of flota and of
+                     your flota-<you> only (as flota traer), then sistema/instalar --go
+    flota instalar [--go]            sistema/instalar
+    flota entregar       every clone of yours whose main its fleet lacks, to that
+                     fleet: one list, one question
+    flota entregar CLON [DESTINO]    a clone of yours to a working AI user (`flota entregar
+                                     ~/agents/x claude`, or `claude:otro/x`); the old
+                                     order, AGENTE CLON, still works. Without DESTINO,
+                                     to the AI user that already has it (`flota
+                                     entregar .`); to another, it asks first.
+                                     sistema/entregar-repo --go; given a folder
+                                     of related repos (~/agents/rc), each of them, into
+                                     the same folder in the agent's ~/work (~/work/rc).
+                                     Anything else: flota pasar
+    flota mover ORIGEN DESTINO
+                     a folder (a repo, a group of repos, or plain files) from one AI user
+                     to another (`flota mover codex:repo_clases pensadero`). Stops if
+                     anything could be lost (uncommitted work, unaccepted branches, a
+                     session working there). Repos keep their history, in your clones
+                     and in the destination; the origin goes to its AI user's
+                     ~/work/TRASH, with a line in TRASH/README.md
+    flota clonar AGENTE REPO [DEST] [--rama RAMA]
+                                     show clonar.py's commands, and run them if you say so
+    flota estado     each AI user: its roles and clusters, its live sessions (where,
+                     how long quiet; claude's tokens), its folders and when each
+                     last changed, and its unanswered mail. Reads only; asks each
+                     AI user with sudo -u, as flota reiniciar does
+    flota estado CARPETA
+                     your copy of a project against the fleet's, changing nothing:
+                     `.` (or a path under ~/agents, its fleet deduced) or
+                     pensadero:proyecto. Its repos: branches to bring, commits of
+                     your main the fleet lacks. The rest, outside git on both sides:
+                     files only here, only there, newer on which side, and their size
+    flota cluster CLUSTER [AGENTE...]
+                     clusters/add-cluster for each AI user with a box there in
+                     fleet.toml (or those named): shows its plan, asks, then --go
+    flota actualizar codex           install, for every agent that runs codex, the version
+                                     [software] codex of fleet.toml (fixed: no automatic
+                                     updates), then check each still loads its rules
+    flota reiniciar [--seguir] [--forzar] [USUARIO...] [SESIÓN...]
+                     restart the claude sessions of every AI user that runs claude
+                     (the pensadero's too), or of those named, so they load the
+                     installed rules, coord first (codex ones too: /exit, then codex
+                     or, with --seguir, codex resume <its thread>): shows each one's context, idleness and watchers, asks,
+                     then types /exit and starts it again in the same pane. Fresh by
+                     default (no conversation; it is told to read its notes and wait);
+                     --seguir resumes the same conversation (claude -r); --forzar
+                     restarts it even if it was active in the last 2 minutes
+
+Every step that changes something asks first, and a branch is merged only after
+you have been shown its diff. git runs only in your own clones; nothing is pushed.
+
+Run as yourself, from your clone (alias flota=~/agents/flota/sistema/flota).
+It changes nothing. What is pending is derived now, never kept:
+  - proposals in the mailbox that nobody has answered yet (buzon);
+  - whether the planner has something to install (it runs it, which only prints);
+  - agent branches not merged into main in your clones under ~/agents, as of your
+    last `git fetch` (it does not fetch: that asks for your sudo password).
+"""
+import getpass, glob, grp, json, os, re, shlex, shutil, subprocess, sys, textwrap, time, unicodedata
+
+AQUI = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # the clone
+CHULETA = os.path.join(AQUI, "COMANDOS.md")
+BUZON = "/home/agents/bin/buzon"
+CLONES = os.path.expanduser("~/agents")
+
+
+def plano(t):
+    return "".join(c for c in unicodedata.normalize("NFD", t.lower()) if not unicodedata.combining(c))
+
+
+def color(codigo):
+    on = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    return lambda t: f"\033[{codigo}m{t}\033[0m" if on else t
+
+
+BANDA, TITULO, TENUE, AVISO, CODIGO, OK = (color("1;7;36"), color("1"), color("2"),
+                                           color("1;33"), color("33"), color("32"))
+ANCHO = max(40, min(100, shutil.get_terminal_size((100, 24)).columns))   # 40: a phone
+
+
+def banda(texto):
+    """A section title: a full-width bar, easy to find when scrolling."""
+    print("\n" + BANDA(f" {texto} ".ljust(ANCHO)))
+
+
+def codigo(linea, abierto=False):
+    """`code` spans in colour, backticks dropped. A span may run over a wrapped line,
+    so the state carries from one line to the next."""
+    partes, out = linea.split("`"), []
+    for i, p in enumerate(partes):
+        if i:
+            abierto = not abierto
+        out.append(CODIGO(p) if abierto and p else p)
+    return "".join(out), abierto
+
+
+def parrafo(texto, sangria, estilo=None):
+    abierto = False
+    for linea in textwrap.wrap(texto, ANCHO - len(sangria), break_on_hyphens=False) or [""]:
+        hecho, abierto = codigo(linea, abierto)
+        print(sangria + (estilo(hecho) if estilo else hecho))
+
+
+def chuleta(tema=None):
+    with open(CHULETA, encoding="utf-8") as f:
+        texto = f.read()
+    humano = instalado().get("human", {})
+    for k in ("name", "user", "timezone"):          # its templates, as the planner fills them
+        if humano.get(k):
+            texto = texto.replace("{{human." + k + "}}", humano[k])
+    partes = re.split(r"(?m)^(?=## )", texto)
+    if tema:
+        partes = [p for p in partes[1:] if plano(tema) in plano(p.splitlines()[0])]
+        if not partes:
+            temas = [p.splitlines()[0][3:] for p in re.split(r"(?m)^(?=## )", texto)[1:]]
+            sys.exit(f"flota: no hay sección '{tema}'. Temas: {', '.join(temas)}")
+    for p in partes:
+        lineas, suelto = p.rstrip().splitlines(), []
+        for linea in lineas + [""]:
+            if suelto and not linea.strip() or linea.startswith(("#", "|")):
+                if suelto:                            # plain text dimmed; a "Nunca..." stands out
+                    texto_p = " ".join(suelto)
+                    parrafo(texto_p, "  ", AVISO if texto_p.startswith("Nunca") else TENUE)
+                    print()
+                    suelto = []
+            if linea.startswith("# "):
+                banda(linea[2:].strip().upper())      # the file's own title
+                print()
+                continue
+            if linea.startswith("## "):
+                banda(linea[3:].strip().upper())
+                print()
+            elif linea.startswith(("| :---", "| quiero")):
+                continue                              # the table's header
+            elif linea.startswith("|"):
+                celdas = [c.strip() for c in linea.strip().strip("|").split("|")]
+                parrafo(celdas[0], "  > ", TITULO)    # what you want
+                parrafo(" | ".join(celdas[1:]), "      ")   # how
+                print()
+            elif linea.strip():
+                suelto.append(linea.strip())
+
+
+def clones(carpeta=None):
+    """Your clones: CARPETA itself if it is a repo, else the repos directly in it.
+    Without CARPETA, those of ~/agents: each repo there, and the repos in each folder
+    of related repos there (~/agents/<group>/<repo>)."""
+    if carpeta:
+        carpeta = os.path.realpath(os.path.expanduser(carpeta))
+        if os.path.isdir(os.path.join(carpeta, ".git")):
+            return [carpeta]
+        return sorted(os.path.dirname(g) for g in glob.glob(os.path.join(carpeta, "*", ".git")))
+    out = []
+    for d in sorted(glob.glob(os.path.join(CLONES, "*", ""))):
+        out += clones(d)
+    return out
+
+
+def raiz_de(carpeta, avisar=False):
+    """The repo that holds carpeta, when carpeta is inside one under ~/agents (`.` in
+    ~/agents/x/src is ~/agents/x); else carpeta itself. avisar: say so (traer and
+    entregar, which then work on that repo)."""
+    carpeta = os.path.realpath(os.path.expanduser(carpeta))
+    tope = os.path.realpath(CLONES)
+    d = carpeta
+    while d.startswith(tope + "/"):
+        if os.path.isdir(os.path.join(d, ".git")):
+            if d != carpeta and avisar:
+                print(TENUE(f"{carpeta} está adentro del repo {d}: uso el repo"))
+            return d
+        d = os.path.dirname(d)
+    return carpeta
+
+
+def corto(repo):
+    """rc/a for ~/agents/rc/a; the folder's name elsewhere."""
+    rel = os.path.relpath(repo, CLONES)
+    return rel if not rel.startswith("..") else os.path.basename(repo)
+
+
+def correr(cmd, cwd=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=120)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def item(estado, que, explica, hacer=None):
+    """One pending item: its state, one line on what it means, and what to do."""
+    marca = OK("  ok ") if estado == "ok" else AVISO("  !! ") if estado == "hay" else AVISO("  ?? ")
+    print(marca + TITULO(que))
+    parrafo(explica, "       ", TENUE)
+    if hacer:
+        parrafo("-> " + hacer, "       ")
+    print()
+
+
+def grupos_sin_activar():
+    """Your groups that this login does not carry yet: the plan adds you to the AI
+    users' groups, and a group applies only to a new login."""
+    activos = set(os.getgroups())
+    yo = getpass.getuser()
+    return sorted(g.gr_name for g in grp.getgrall() if yo in g.gr_mem and g.gr_gid not in activos)
+
+
+GRUPOS = ("Tu sesión todavía no tiene los grupos {g}: Linux los aplica solo en un login nuevo, "
+          "y una terminal nueva del mismo escritorio hereda los viejos. Cerrá la sesión del "
+          "escritorio y volvé a entrar; para seguir ya en esta terminal: exec su -l $USER")
+
+
+def exigir_grupos():
+    """Stop, with what to do, before a command that needs the AI users' groups."""
+    faltan = grupos_sin_activar()
+    if faltan:
+        sys.exit("flota: " + GRUPOS.format(g=", ".join(faltan)))
+
+
+def pendiente():
+    banda("PENDIENTE AHORA")
+    print()
+    faltan = grupos_sin_activar()
+    if faltan:
+        item("hay", f"grupos sin activar: {', '.join(faltan)}", GRUPOS.format(g=", ".join(faltan)),
+             "cerrá la sesión y volvé a entrar, o `exec su -l $USER`")
+    for u in sin_box():
+        item("hay", f"{u} no tiene box en ningún cluster",
+             "Es un usuario IA de trabajo, y tus clusters solo declaran box para otros: sus "
+             "sesiones no pueden trabajar en ninguno.",
+             f"agregá {u} al `box` de cada cluster en tu fleet.toml, hacé su llave en "
+             f"`t{u}` y corré `clusters/add-cluster <cluster> {u} --go` (docs/clusters.md)")
+    rc, out, err = correr([BUZON, "listar", "--tipo", "propuesta", "--sin-respuesta"])
+    if rc != 0:
+        item("?", "propuestas: no pude preguntarle al buzón",
+             (err.strip().splitlines() or ["?"])[-1])
+    else:
+        n = len(re.findall(r"(?m)^[ *] \d{8}-", out))
+        item("hay" if n else "ok", f"propuestas sin procesar: {n}",
+             "Mejoras a las reglas que propusieron los agentes y nadie revisó todavía.",
+             'decile al arquitecto: "procesá lo aprendido"' if n else None)
+    rc, out, err = correr([sys.executable, os.path.join(AQUI, "sistema", "plan-agentes.py")], cwd=AQUI)
+    if rc != 0:
+        item("?", "instalación: el planner falló", (err.strip().splitlines() or ["?"])[-1])
+    else:
+        # routine checks (what the planner cannot see, in the AI users' homes) are
+        # always there and change nothing when all is in place: count the changes
+        m = re.search(r"(?m)^# changes: (\d+), routine checks: (\d+)$", out)
+        reales, rutinas = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        m = re.search(r"FILES THAT CHANGE \((\d+)\)", err)
+        archivos = int(m.group(1)) if m else 0
+        item("hay" if reales else "ok",
+             f"por instalar: {archivos} archivo(s) que cambian, {reales} cambio(s) en total",
+             "Lo que tus clones tienen y la máquina todavía no. Las "
+             f"{rutinas} comprobaciones de rutina (carpetas de los usuarios IA "
+             "que no podés ver) no cuentan: no cambian nada si todo está en su lugar.",
+             "`flota instalar` para ver qué cambia; `flota instalar --go` para aplicarlo" if reales else None)
+    ramas, sin = [], []
+    for repo in clones():
+        base = principal(repo)
+        if not base:
+            sin.append(os.path.relpath(repo, CLONES))
+            continue
+        rc, out, _ = correr(["git", "-C", repo, "branch", "-r", "--no-merged", base, "--list",
+                             *(f"{u}/*" for u in instalado().get("ai_users", {}) or ("claude", "codex"))])
+        for r in out.split():
+            if not r.endswith(("/main", "/master", "/HEAD", "->")):
+                ramas.append(f"{os.path.relpath(repo, CLONES)}: {r}")
+    if sin:
+        item("hay", f"clones sin main ni master: {', '.join(sin)}",
+             "No puedo saber qué ramas de agentes faltan aceptar ahí.",
+             "creá la rama principal (`git switch -c main`) en cada uno")
+    item("hay" if ramas else "ok", f"ramas de agentes sin mergear: {len(ramas)}",
+         "Trabajo que un agente te dejó para revisar, según tu último `git fetch claude`.",
+         "`flota traer`: te muestra cada una y la mergea si le decís que sí" if ramas else None)
+    for r in ramas:
+        print("         " + r)
+
+
+# What `flota arrancar` runs as the claude coordinator's user, inside `sudo machinectl
+# shell <user>@`, so the
+# session lands in claude's own slice, as with tclaude. Fixed text from YOUR clone;
+# nothing an agent wrote is run. The passphrase is typed by you, in your terminal,
+# into ssh-add itself: never into a window an agent opened. Each @program@ is the
+# absolute path YOUR PATH gives (binario), so nothing in the agent's own PATH
+# (~/.local/bin) is run in its place.
+LLAVE = r"""
+set -u
+sock="$HOME/.ssh/agente.sock"
+if ! compgen -G "$HOME/.ssh/id_*.pub" >/dev/null; then   # no key yet: no clusters to open
+  echo "$(id -un) no tiene llave de clusters todavía: arranco sin ssh-agent"
+else
+  SSH_AUTH_SOCK="$sock" @ssh-add@ -l >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 2 ]; then                    # no agent behind the socket: start one
+    rm -f "$sock"
+    @ssh-agent@ -a "$sock" >/dev/null || { echo "flota: no pude arrancar ssh-agent"; exit 1; }
+    rc=1
+  fi
+  if [ "$rc" = 1 ]; then
+    echo "Clave de los clusters para $(id -un) (queda abierta hasta ssh-add -D o un reinicio):"
+    SSH_AUTH_SOCK="$sock" @ssh-add@ || echo "(sin clave: los agentes no van a entrar a los clusters)"
+  fi
+fi
+"""
+VENTANA = r"""
+if ! @tmux@ has-session -t @sesion@ 2>/dev/null; then
+  @tmux@ new-session -d -s @sesion@ -n @ventana@ -c "$HOME/@carpeta@"; nuevo=1
+elif ! @tmux@ list-windows -t @sesion@ -F '#W' | grep -qx @ventana@; then
+  @tmux@ new-window -d -t @sesion@ -n @ventana@ -c "$HOME/@carpeta@"; nuevo=1
+else
+  echo "$(id -un): @ventana@ ya tiene su ventana en @sesion@: no lo arranco de nuevo"; nuevo=0
+fi
+# typed by YOUR script into a fresh shell: the prompt is yours, not an agent's
+[ "$nuevo" = 1 ] && @tmux@ send-keys -t @sesion@:@ventana@ @orden@ Enter
+"""
+DESPERTADOR = r"""
+if @pgrep@ -u "$(id -u)" -f '/home/agents/bin/buzon despertador' >/dev/null; then
+  echo "$(id -un): el despertador ya corre"
+else
+  mkdir -p "$HOME/.local/state/buzon"
+  @setsid@ @nohup@ /home/agents/bin/buzon despertador >> "$HOME/.local/state/buzon/despertador.log" 2>&1 < /dev/null &
+  echo "$(id -un): despertador arrancado (registro: ~/.local/state/buzon/despertador.log)"
+fi
+"""
+# How each role resumes its last conversation; coord is asked to resume the rest.
+REANUDAR = {("claude", "coord"): 'claude -c -n coord "Retomá la flota"',
+            ("codex", "coord"): 'codex resume --last "Retomá la flota"',
+            ("claude", "maestro"): 'claude -c -n maestro "Retomá el pensadero"',
+            ("codex", "maestro"): 'codex resume --last "Retomá el pensadero"'}
+
+
+def arranques():
+    """{AI user: (tmux session, window, folder, command)} of what flota arrancar opens:
+    each working AI user's coord, in its first provider, and each pensadero's maestro,
+    in claude when it has claude (from there it reaches agents of both tools)."""
+    out = {}
+    for u, a in instalado().get("ai_users", {}).items():
+        provs = a.get("providers") or [a.get("provider", "claude")]
+        pv = provs[0]
+        roles = set(a.get("roles", []))
+        if roles & {"pensadero", "maestro"} and "claude" in provs:
+            pv = "claude"
+        if "coord" in roles:
+            out[u] = ("flota", "coord", "coord", REANUDAR[(pv, "coord")])
+        elif roles & {"pensadero", "maestro"}:
+            out[u] = (u, "maestro", "maestro", REANUDAR[(pv, "maestro")])
+    return out
+
+
+def binario(nombre):
+    """The absolute path of a program, as YOUR PATH finds it. It goes into what runs as
+    an agent, so the agent's own PATH never chooses the program."""
+    ruta = shutil.which(nombre)
+    if not ruta:
+        sys.exit(f"flota: no encuentro {nombre} en tu PATH")
+    return ruta
+
+
+def instalado():
+    """The installed fleet.toml, or {} if it cannot be read."""
+    import tomllib
+    try:
+        with open("/home/agents/etc/fleet/fleet.toml", "rb") as f:
+            cfg = tomllib.load(f)
+    except (OSError, ValueError):
+        return {}
+    if "ai_users" not in cfg and "agents" in cfg:   # the old name of [ai_users]
+        cfg["ai_users"] = cfg.pop("agents")
+    return cfg
+
+
+def de_trabajo():
+    """The working AI users (not a pensadero) of the installed fleet.toml."""
+    return [u for u, a in instalado().get("ai_users", {}).items()
+            if not {"pensadero", "maestro"} & set(a.get("roles", []))]
+
+
+def sin_box():
+    """Working AI users with a box on no cluster, when the fleet has clusters at all
+    (codex had none on any, 2026-10-16, and nothing said so)."""
+    clusters = instalado().get("cluster", {})
+    if not clusters:
+        return []
+    con = {u for c in clusters.values() for u in c.get("box", {})}
+    return [u for u in de_trabajo() if u not in con]
+
+
+def arrancar(quienes=()):
+    """Start the fleets after a reboot or a crash, every one or those named: the cluster
+    key of each working AI user (you type each passphrase), then its tmux with its
+    session resumed: coord, asked to resume the rest; a pensadero's maestro. You land in
+    the first one's window; the others wait in theirs (tclaude, tcodex, tpensadero)."""
+    usuarios = instalado().get("ai_users", {})
+    for u in quienes:
+        if u not in usuarios:
+            sys.exit(f"flota: {u} no es un usuario IA de fleet.toml ({', '.join(usuarios)})")
+    lista = list(quienes) or list(usuarios)
+    abrir = arranques()
+    llenar = lambda texto: re.sub(r"@([a-z-]+)@", lambda m: binario(m.group(1)), texto)
+    primero = None
+    for u in lista:
+        guion = llenar(LLAVE) if u in de_trabajo() else ""
+        if u in abrir:
+            sesion, ventana, carpeta, orden = abrir[u]
+            guion += llenar(VENTANA.replace("@sesion@", sesion).replace("@ventana@", ventana)
+                            .replace("@carpeta@", carpeta).replace("@orden@", shlex.quote(orden)))
+            primero = primero or (u, f"{sesion}:{ventana}")
+            a = usuarios[u]
+            if "codex" in (a.get("providers") or [a.get("provider", "claude")]):
+                # codex cannot keep a mailbox wait past its turn: the despertador wakes the
+                # sessions that asked (buzon atento), from outside the sandbox, in the background
+                guion += llenar(DESPERTADOR)
+        elif u not in de_trabajo():
+            continue
+        else:
+            print(TENUE(f"{u}: sin coord en fleet.toml, solo su llave"))
+        subprocess.run(["sudo", "machinectl", "shell", f"{u}@", binario("bash"), "-lc", guion])
+    if not primero:
+        sys.exit("flota: nada que abrir: ninguno tiene coord ni es un pensadero")
+    u, donde = primero
+    os.execvp("sudo", ["sudo", "machinectl", "shell", f"{u}@", binario("tmux"), "attach", "-t", donde])
+
+
+# ---- doing things: every step asks first ----------------------------------------
+
+def coord_claude():
+    """The claude AI user of the installed fleet.toml that has the role coord."""
+    agentes = instalado().get("ai_users", {})
+    return next((u for u, a in agentes.items()
+                 if "claude" in a.get("providers", [a.get("provider")]) and "coord" in a.get("roles", [])), None)
+
+PUSHURL = "/dev/null/no-push-fetch-only"     # how clonar.py and entregar-repo mark an agent's remote
+
+
+def si(pregunta, defecto=False):
+    """Ask on the terminal; Enter takes the default."""
+    try:
+        r = input(pregunta + (" [S/n] " if defecto else " [s/N] ")).strip().lower()
+    except EOFError:
+        return False
+    return defecto if not r else r in ("s", "si", "sí", "y", "yes")
+
+
+def git(repo, *args, capturar=True):
+    if capturar:
+        r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+        return r.returncode, r.stdout.strip()
+    return subprocess.run(["git", "-C", repo, *args]).returncode, ""
+
+
+def principal(repo):
+    """Your clone's accepted branch: main, or master in a repo that keeps the old name
+    (2026-10-20); None if it has neither."""
+    for rama in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{rama}")[0] == 0:
+            return rama
+    return None
+
+
+def remotos_de_agentes(repo):
+    """{remote: name of the repo in the agent's ~/work} for the agents' fetch-only remotes."""
+    out = {}
+    rc, txt = git(repo, "config", "--get-regexp", r"^remote\..*\.pushurl$")
+    for linea in txt.splitlines():
+        clave, _, valor = linea.partition(" ")
+        if valor == PUSHURL:
+            remoto = clave[len("remote."):-len(".pushurl")]
+            _, url = git(repo, "config", f"remote.{remoto}.url")
+            # its path under the agent's ~/work: a repo, or <group>/<repo>
+            m = re.search(r"/work/(.+?)/*$", url)
+            out[remoto] = m.group(1) if m else os.path.basename(repo)
+    return out
+
+
+def ramas_nuevas(repo, remoto, base="main"):
+    """The agent's branches not in your main (or master), fewest new commits first (a
+    branch stacked on another comes after it)."""
+    rc, txt = git(repo, "branch", "-r", "--no-merged", base, "--list", f"{remoto}/*")
+    ramas = [r.strip() for r in txt.splitlines()
+             if r.strip() and "->" not in r and not r.strip().endswith(("/main", "/master", "/HEAD"))]
+    def adelante(r):
+        return int(git(repo, "rev-list", "--count", f"{base}..{r}")[1] or 0)
+    return sorted(ramas, key=adelante)
+
+
+def revisar(repo, rama, base="main"):
+    """Show a branch: its commits, the files it touches, then the whole diff in a pager."""
+    banda(f"{corto(repo)}: {rama}")
+    print()
+    print(TITULO("  commits:"))
+    print("  " + git(repo, "log", "--oneline", "--no-decorate", f"{base}..{rama}")[1].replace("\n", "\n  "))
+    print(TITULO("\n  archivos:"))
+    print("  " + git(repo, "diff", "--stat", f"{base}...{rama}")[1].replace("\n", "\n  "))
+    print()
+    if si("  ¿Ver el diff completo? (q para salir del visor)"):
+        env = dict(os.environ, LESS=os.environ.get("LESS", "-R"))
+        subprocess.run(["git", "-C", repo, "-c", "color.ui=always", "diff", f"{base}...{rama}"], env=env)
+
+
+CASAS = "/home"
+
+
+def de_un_agente(ruta):
+    """The AI user whose home holds ruta, or None."""
+    for u in instalado().get("ai_users", {}):
+        if ruta.startswith(f"{CASAS}/{u}/"):
+            return u
+    return None
+
+
+def traer(destino=None, lista=None):
+    lista = lista if lista is not None else clones(destino)
+    if destino and not lista:
+        sys.exit(f"flota: no git repository in {destino}")
+    cambiados = {}                               # clone -> {remote: agent's repo name}
+    for repo in lista:
+        remotos = remotos_de_agentes(repo)
+        if not remotos:
+            if destino:
+                sys.exit(f"flota: {repo} has no agent remote (clonar.py or entregar-repo adds one)")
+            continue
+        base = principal(repo)
+        if not base:
+            print(AVISO(f"\n{corto(repo)} no tiene main ni master: no sé contra qué rama comparar; lo salteo"))
+            continue
+        for remoto, nombre_agente in remotos.items():
+            print(TENUE(f"\n{corto(repo)}: git fetch {remoto} (sudo puede pedir tu contraseña)"))
+            if git(repo, "fetch", remoto, capturar=False)[0] != 0:
+                print(AVISO(f"  no pude traer de {remoto}: sigo con lo que ya estaba"))
+                if not os.path.isdir(git(repo, "config", f"remote.{remoto}.url")[1]):
+                    avisar_muertos([(repo, remoto)])
+            vistas = set()
+            while True:
+                ramas = [r for r in ramas_nuevas(repo, remoto, base) if r not in vistas]
+                if not ramas:
+                    break
+                rama = ramas[0]
+                vistas.add(rama)
+                revisar(repo, rama, base)
+                if not si(f"  ¿Mergeo {rama} en {corto(repo)}?", defecto=True):
+                    print(TENUE("  no la mergeé"))
+                    continue
+                actual = git(repo, "symbolic-ref", "--short", "HEAD")[1]
+                sucio = git(repo, "status", "--porcelain", "--untracked-files=no")[1]
+                if actual != base or sucio:
+                    print(AVISO(f"  {corto(repo)} no está limpio en {base}"
+                                f" (rama {actual or '?'}{', con cambios' if sucio else ''}): no mergeo"))
+                    continue
+                if git(repo, "merge", "--ff-only", "-q", rama, capturar=False)[0] != 0:
+                    suya = rama        # its fetch maps <agent>/<topic> onto the same name
+                    print(AVISO(f"  {rama} salió de un {base} viejo: tu {base} avanzó después. No toco nada."))
+                    parrafo(f"Si ya le entregaste tu {base}, decile en su ventana: \"Mergeá "
+                            f"{getpass.getuser()}/{base} en {suya} (merge, no rebase) y avisame\". Si no, "
+                            f"primero: flota entregar {repo} {remoto}. Después, otra vez flota traer.", "  ")
+                    continue
+                print(OK(f"  mergeada: {rama}"))
+                cambiados.setdefault(repo, {})[remoto] = nombre_agente
+                if repo == AQUI:
+                    print(AVISO("  flota se actualizó: lo que sigue (instalar, entregar) ya usa la versión nueva"))
+    if not cambiados:
+        print("\nNada nuevo para mergear.")
+        return
+    instala = [r for r in cambiados if r == AQUI or os.path.basename(r).startswith("flota-")]
+    if instala and lista != repos_de_la_flota():
+        print(AVISO("\n  Cambió " + ", ".join(os.path.basename(r) for r in instala)
+                    + ": para instalarlo, flota actualizar (o flota instalar --go)"))
+    banda("ENTREGAR TU MAIN A LOS AGENTES")
+    print()
+    parrafo("Así su copia queda al día con lo que aceptaste (`entregar-repo`).", "  ")
+    for repo, remotos in cambiados.items():
+        for agente, nombre in remotos.items():
+            if si(f"  ¿Le entrego tu main de {corto(repo)} a {agente}?", defecto=True):
+                subprocess.run([os.path.join(AQUI, "sistema", "entregar-repo"), agente, repo,
+                                "--name", nombre, "--go"])
+
+
+def repos_de_la_flota():
+    """Your clone of flota and your configuration beside it ($FLOTA_CONFIG, or the one
+    flota-<you> with a fleet.toml), as sistema/instalar finds them."""
+    cfg = os.environ.get("FLOTA_CONFIG")
+    if cfg:
+        cfg = os.path.realpath(os.path.expanduser(cfg))
+        cfg = os.path.dirname(cfg) if os.path.isfile(cfg) else cfg
+    else:
+        hay = glob.glob(os.path.join(os.path.dirname(AQUI), "flota-*", "fleet.toml"))
+        cfg = os.path.dirname(hay[0]) if len(hay) == 1 else None
+    return [AQUI] + ([cfg] if cfg and os.path.isdir(os.path.join(cfg, ".git")) else [])
+
+
+def actualizar_flota():
+    """flota actualizar: the fleet itself, not your projects. Brings the architect's
+    branches of flota and of your configuration (each with its diff and your yes, as
+    flota traer), then sistema/instalar --go, which shows what changes on the machine
+    and asks again; it runs even when nothing new came, so a branch brought earlier with
+    flota traer gets installed here."""
+    lista = repos_de_la_flota()
+    banda("TRAER: " + ", ".join(os.path.basename(r) for r in lista))
+    traer(lista=lista)
+    banda("INSTALAR")
+    r = subprocess.run([os.path.join(AQUI, "sistema", "instalar"), "--go"]).returncode
+    if r == 0:
+        parrafo("\nPara que las sesiones carguen lo nuevo: flota reiniciar.", "  ")
+    avisar_proveedores()
+    return r
+
+
+def ultima_version(paquete):
+    """The newest version npm publishes of a package, or None (offline, or the registry
+    said something else). Only read: nothing is installed."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"https://registry.npmjs.org/{paquete}/latest", timeout=6) as f:
+            v = json.load(f).get("version")
+    except Exception:
+        return None
+    return v if isinstance(v, str) and re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", v) else None
+
+
+def mas_nueva(a, b):
+    """True when version b is newer than a (numbers compared as numbers)."""
+    clave = lambda v: [int(x) if x.isdigit() else x for x in re.split(r"[.+-]", v)]
+    try:
+        return clave(b) > clave(a)
+    except TypeError:
+        return a != b
+
+
+def avisar_proveedores():
+    """Only a notice: a newer codex than the one fleet.toml pins, or a newer Claude Code
+    than the one installed. Neither is updated here: codex moves version through
+    fleet.toml and the aparejador (docs/instalacion.md), claude with the package manager."""
+    banda("PROVEEDORES")
+    cfg = instalado()
+    usan = lambda p: any(p in a.get("providers", [a.get("provider")])
+                         for a in cfg.get("ai_users", {}).values())
+    if usan("codex"):
+        fijada, ultima = str(cfg.get("software", {}).get("codex", "")), ultima_version("@openai/codex")
+        if not ultima:
+            print(TENUE("  codex: no pude consultar la última versión (npm)"))
+        elif fijada and mas_nueva(fijada, ultima):
+            print(AVISO(f"  codex: fijada {fijada}; hay {ultima}. Para pasar: [software] codex en fleet.toml, "
+                        "flota actualizar, flota actualizar codex, y que el aparejador revise (docs/instalacion.md)"))
+        else:
+            print(OK(f"  codex {fijada}: la última"))
+    if usan("claude"):
+        rc, out = 1, ""
+        try:
+            p = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=20)
+            rc, out = p.returncode, p.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        m = re.match(r"\s*([0-9][0-9A-Za-z.+-]*)", out) if rc == 0 else None
+        ultima = ultima_version("@anthropic-ai/claude-code")
+        if not m or not ultima:
+            print(TENUE("  claude: no pude ver la versión instalada o la última (npm)"))
+        elif mas_nueva(m.group(1), ultima):
+            print(AVISO(f"  claude: instalado {m.group(1)}; hay {ultima}. Se actualiza con tu gestor de "
+                        "paquetes, cuando lo empaqueta (en Arch, sudo pacman -Syu)"))
+        else:
+            print(OK(f"  claude {m.group(1)}: la última"))
+
+
+def traer_sin_clon(mia):
+    """flota traer ~/agents/<path> with no clone there: the repos of the fleet that has
+    <path> (a project lives in one), cloned safely, as flota clonar does."""
+    rel = os.path.relpath(mia, os.path.realpath(CLONES))
+    if rel == "." or rel.startswith(".."):
+        sys.exit(f"flota: no git repository in {mia}")
+    usuarios = instalado().get("ai_users", {})
+    tienen = [u for u in usuarios if os.path.isdir(f"{CASAS}/{u}/work/{rel}")
+              and tiene_repos(f"{CASAS}/{u}/work/{rel}")]
+    if not tienen:
+        sys.exit(f"flota: no git repository in {mia}, nor {rel} with a repo in any fleet")
+    if len(tienen) > 1:
+        sys.exit(f"flota: {rel} is in {' and '.join(tienen)}: a project lives in one fleet. "
+                 f"Leave one with flota mover")
+    u = tienen[0]
+    suya = f"{CASAS}/{u}/work/{rel}"
+    repos = [rel] if os.path.isdir(os.path.join(suya, ".git")) else sorted(
+        os.path.relpath(os.path.dirname(g), f"{CASAS}/{u}/work")
+        for g in glob.glob(os.path.join(suya, "**", ".git"), recursive=True))
+    print(f"No tenés clon de {rel}: está en {u}:{rel}, con {len(repos)} repo(s). Lo clono de forma "
+          f"segura (como flota clonar); lo que no está en git lo trae flota pasar {u}:{rel}.")
+    for r in repos:
+        clonar_uno([u, r, os.path.join(CLONES, r)])
+
+
+def lugar(texto):
+    """scp-like: 'claude:proyecto_a' -> ('claude', ~claude/work/proyecto_a); 'claude:' or a bare
+    AI user -> its whole ~/work (the pensadero's too); a path under an AI user's
+    home -> that user and the path; anything else -> (None, your path)."""
+    usuarios = instalado().get("ai_users", {})
+    u, sep, rel = texto.partition(":")
+    if u in usuarios and (sep or texto == u):
+        base = f"{CASAS}/{u}/work"
+        rel = rel.strip("/")
+        if ".." in rel.split("/"):
+            sys.exit(f"flota: {texto}: no '..' inside an AI user's folder")
+        return u, base, os.path.join(base, rel) if rel else base
+    ruta = os.path.realpath(os.path.expanduser(texto))
+    return de_un_agente(ruta), None, ruta
+
+
+def duenos(lista):
+    """{AI user: folder in its ~/work} of the agents that already have these clones (one
+    repo, or every repo of a group, in the same group folder), from your clones' agent
+    remotes. A remote whose folder is gone is left out: it is listed apart."""
+    usuarios = instalado().get("ai_users", {})
+    tienen, muertos = None, set()
+    for repo in lista:
+        aca = {}
+        for remoto, rel in remotos_de_agentes(repo).items():
+            if remoto not in usuarios:
+                continue
+            if not os.path.isdir(git(repo, "config", f"remote.{remoto}.url")[1]):
+                muertos.add((repo, remoto))
+                continue
+            aca[remoto] = rel if len(lista) == 1 else os.path.dirname(rel)
+        tienen = aca if tienen is None else {u: r for u, r in tienen.items() if aca.get(u) == r}
+    return tienen or {}, sorted(muertos)
+
+
+def avisar_muertos(muertos):
+    for repo, remoto in muertos:
+        print(AVISO(f"  {corto(repo)}: el remoto {remoto} apunta a una carpeta que ya no existe. "
+                    f"Sacalo: git -C {repo} remote remove {remoto}"))
+
+
+def entregar_todo():
+    """flota entregar, with nothing: each of your clones whose main its fleet lacks goes
+    to that fleet (the one that has it: a project lives in one). One list, one question."""
+    usuarios = instalado().get("ai_users", {})
+    van, sin_duenio = [], []
+    for repo in clones():
+        tienen, muertos = duenos([repo])
+        avisar_muertos(muertos)
+        if len(tienen) != 1:
+            if len(tienen) > 1:
+                sin_duenio.append((repo, "lo tienen " + ", ".join(tienen) + " (flota mover)"))
+            continue
+        (u, rel), = tienen.items()
+        base = principal(repo)
+        if not base or u not in usuarios:
+            continue
+        git(repo, "fetch", "-q", u)
+        falta = int(git(repo, "rev-list", "--count", base, "--not", f"--remotes={u}/*")[1] or 0)
+        if falta:
+            van.append((repo, u, rel, falta))
+    for repo, por_que in sin_duenio:
+        print(AVISO(f"  {corto(repo)}: {por_que}"))
+    if not van:
+        print(OK("Cada flota ya tiene tu main: nada que entregar."))
+        return
+    banda("ENTREGAR TU MAIN A SU FLOTA")
+    for repo, u, rel, falta in van:
+        print(f"  {corto(repo)}  →  {u}:{rel}   ({falta} commit(s) que no tiene)")
+    if not si(f"  ¿Entrego {'los ' + str(len(van)) if len(van) > 1 else 'este'}?", defecto=True):
+        return
+    for repo, u, rel, _ in van:
+        subprocess.run([os.path.join(AQUI, "sistema", "entregar-repo"), u, repo, "--name", rel, "--go"])
+
+
+def entregar_a(origen, destino=None):
+    """flota entregar CLON [DESTINO]: a destination folder that exists gets the clone inside
+    it, unless it is the agent's copy of that repo already (then it is brought up to
+    date). Without DESTINO, it goes to the AI user that already has it, where it has it.
+    To anyone else, it asks first: that is a second copy. The old order (AGENTE CLON) is
+    turned around."""
+    usuarios = instalado().get("ai_users", {})
+    if destino and origen in usuarios and lugar(destino)[0] is None:          # the old order
+        origen, destino = destino, origen
+    u_o, _, src = lugar(origen)
+    lista = [] if u_o else clones(src)
+    if not lista:
+        sys.exit(f"flota: {src} is not a clone of yours (nor a folder of them): to copy it, flota pasar")
+    tienen, muertos = duenos(lista)
+    avisar_muertos(muertos)
+    if destino is None:
+        if len(tienen) == 1:
+            (u_d, rel), = tienen.items()
+            print(f"{corto(src)} -> {u_d}:{rel} (quien ya lo tiene)")
+            return entregar(u_d, src, rel)
+        if not tienen:
+            sys.exit(f"flota: ningún agente tiene {corto(src)} todavía: decí a quién, "
+                     f"flota entregar {origen} claude")
+        sys.exit(f"flota: {corto(src)} lo tienen " + ", ".join(f"{u}:{r}" for u, r in tienen.items())
+                 + f": decí a cuál, flota entregar {origen} <usuario IA>")
+    u_d, base, dst = lugar(destino)
+    if u_d is None or base is None:
+        sys.exit("flota: the destination is an AI user: `claude`, or `claude:nombre`")
+    adentro = os.path.isdir(dst) and not os.path.exists(os.path.join(dst, ".git"))
+    final = os.path.join(dst, os.path.basename(src)) if adentro else dst
+    rel = os.path.relpath(final, base)
+    if rel.startswith("..") or rel == ".":
+        sys.exit(f"flota: {final} is not inside {base}")
+    if tienen and tienen.get(u_d) != rel:
+        (u_t, r_t), = list(tienen.items())[:1]
+        sys.exit(f"flota: {corto(src)} ya lo tiene {u_t}:{r_t}, y un proyecto vive en una sola flota. "
+                 f"Para ponerle al día su copia: flota entregar {origen}. Para pasárselo a {u_d}: "
+                 f"flota mover {u_t}:{r_t} {u_d}")
+    return entregar(u_d, src, rel)
+
+
+RSH = os.path.join(AQUI, "sistema", "rsh-agente")
+
+
+def pensadero(u):
+    return bool({"pensadero", "maestro"} & set(instalado().get("ai_users", {}).get(u, {}).get("roles", [])))
+
+
+def tiene_repos(ruta):
+    """Whether a folder is a git repo or holds one, at any depth."""
+    if os.path.isdir(os.path.join(ruta, ".git")):
+        return True
+    for d, dirs, _ in os.walk(ruta):
+        if ".git" in dirs:
+            return True
+    return False
+
+
+def como_proyecto(origen, destino):
+    """(the place pasar_proyecto takes, the fleet named) when origin and destination are
+    the two copies of one project: a folder of yours under ~/agents and a fleet, bare
+    (`flota pasar . pensadero`, `flota pasar pensadero .`) or as <fleet>:<the same
+    path>. None for anything else (a file or folder to a place you name)."""
+    usuarios = instalado().get("ai_users", {})
+    def mio(x):
+        if x in usuarios or (x.partition(":")[0] in usuarios and ":" in x):
+            return None
+        r = os.path.relpath(os.path.realpath(os.path.expanduser(x)), os.path.realpath(CLONES))
+        return None if r == "." or r.startswith("..") else r
+    def flota(x, rel):
+        u, sep, r = x.partition(":")
+        if u not in usuarios:
+            return None
+        return u if not sep or r.strip("/") == rel else None
+    rel = mio(origen)
+    if rel is not None and flota(destino, rel):
+        return os.path.realpath(os.path.expanduser(origen)), flota(destino, rel)   # yours, to its fleet
+    rel = mio(destino)
+    if rel is not None and flota(origen, rel):
+        return f"{flota(origen, rel)}:{rel}", flota(origen, rel)    # from the fleet, to yours
+    # <fleet>:<path> into the folder that holds your copy (`flota pasar pensadero:x .`
+    # standing in ~/agents): the same two copies, said as cp would
+    u, sep, r = origen.partition(":")
+    r = r.strip("/")
+    if u in usuarios and sep and r and destino not in usuarios and ":" not in destino:
+        d = os.path.realpath(os.path.expanduser(destino))
+        if os.path.isdir(d) and os.path.basename(r) != os.path.basename(d) and \
+           os.path.relpath(os.path.join(d, os.path.basename(r)), os.path.realpath(CLONES)) == r:
+            return f"{u}:{r}", u
+    return None
+
+
+def archivo_de_proyecto(texto, flota_pedida):
+    """(origin, destination) for flota pasar when the two sides of a project name one
+    file, not a folder: the file goes to the same folder on the other side, as a plain
+    pasar (the project form compares folders, and found nothing in a file: 2026-11-16).
+    None for a folder."""
+    usuarios = instalado().get("ai_users", {})
+    u, sep, rel = texto.partition(":")
+    if u in usuarios and sep:                                      # from the fleet, to you
+        rel = rel.strip("/")
+        if not os.path.isfile(f"{CASAS}/{u}/work/{rel}"):
+            return None
+        return f"{u}:{rel}", os.path.join(CLONES, os.path.dirname(rel)) + "/"
+    if not os.path.isfile(texto):
+        return None
+    dueno = par(os.path.dirname(texto), flota_pedida)[0]
+    if flota_pedida and dueno != flota_pedida:
+        sys.exit(f"flota: {corto(os.path.dirname(texto))} es de {dueno}, y un proyecto vive en una sola flota")
+    rel = os.path.relpath(texto, os.path.realpath(CLONES))
+    return texto, f"{dueno}:{os.path.dirname(rel)}/"
+
+
+def pasar_proyecto(texto, borrar=False, flota_pedida=None):
+    """flota pasar between the two copies of a project (a project lives in one fleet):
+    `.` or ~/agents/<path> goes to its fleet, <fleet>:<path> comes to ~/agents/<path>.
+    Its repos travel by git (entregar-repo; your review and merge, or a safe clone, as
+    flota traer and flota clonar); everything else by rsync, never a file git follows
+    on either side, never over a newer one (--update). With --borrar, and only in a
+    folder with no repos in it (one inside a repo is fine), it also deletes the loose
+    files only the destination has, listed first. One summary, one question."""
+    usuarios = instalado().get("ai_users", {})
+    viene = texto.partition(":")[0] in usuarios and ":" in texto      # from the fleet to you
+    if flota_pedida and not viene:
+        dueno, mia_ = par(texto, flota_pedida)[:2]
+        if dueno != flota_pedida:
+            sys.exit(f"flota: {corto(mia_)} es de {dueno}, y un proyecto vive en una sola "
+                     f"flota: para pasárselo a {flota_pedida}, flota mover {dueno}:{corto(mia_)} {flota_pedida}")
+    u, mia, suya, filas, d, sin_clon = estado_carpeta(texto, viene=viene,
+                                                      nueva=None if viene else flota_pedida)
+    if borrar and (filas or sin_clon):
+        sys.exit("flota: --borrar solo en una carpeta sin repos adentro, y "
+                 f"{corto(mia)} tiene: " + ", ".join([n for n, *_ in filas] + sin_clon)
+                 + ". Pasá sin --borrar, o una subcarpeta sin repos")
+    sobran = (d["solo_aca"] if viene else d["solo_alla"]) if borrar else []
+    vacias = carpetas_que_sobran(suya if viene else mia, mia if viene else suya, sobran) if borrar else []
+    if viene:
+        repos = [(n, r) for n, r, _, nota in filas if not nota and r]
+        enviar, quedan, de, a = d["solo_alla"] + d["nuevo_alla"], d["nuevo_aca"], suya, mia
+    else:
+        repos = [(n, f) for n, _, f, nota in filas if nota or f]       # it lacks it, or your main
+        enviar, quedan, de, a = d["solo_aca"] + d["nuevo_aca"], d["nuevo_alla"], mia, suya
+    peso = sum(n for _, n in enviar)
+    banda(f"{'de ' + u + ' a vos' if viene else 'de vos a ' + u}")
+    partes = []
+    if repos or (viene and sin_clon):
+        quien = "traídos (ves cada rama y decidís)" if viene else "entregados"
+        partes.append(f"{len(repos) + (len(sin_clon) if viene else 0)} repo(s) git {quien}: "
+                      + ", ".join([n for n, _ in repos] + ([f"{r} (clon nuevo)" for r in sin_clon] if viene else [])))
+    if enviar:
+        partes.append(f"{len(enviar)} archivo(s) suelto(s) copiados ({tamano(peso)})")
+    if quedan:
+        partes.append(f"{len(quedan)} más nuevos del otro lado: no se pisan")
+    if sobran:
+        partes.append(AVISO(f"{len(sobran)} archivo(s) que solo están en "
+                            + ("tu copia" if viene else u) + " se BORRAN (--borrar): ")
+                      + ", ".join(r for r, _ in sobran[:10]) + (" …" if len(sobran) > 10 else ""))
+    if vacias:
+        partes.append(AVISO(f"{len(vacias)} carpeta(s) que solo están en "
+                            + ("tu copia" if viene else u) + " y quedan vacías se BORRAN: ")
+                      + ", ".join(vacias[:5]) + (" …" if len(vacias) > 5 else ""))
+    if not repos and not enviar and not sobran and not vacias and not (viene and sin_clon):
+        print(OK(f"  {'de ' + u + ' a vos' if viene else 'de vos a ' + u}: nada que pasar"))
+        # what waits the other way, so "nothing" is not read as "the same"
+        if viene:
+            otro = [n for n, _, f, nota in filas if nota or f] + [r for r, _ in d["solo_aca"] + d["nuevo_aca"]]
+            vuelta = f"flota pasar {corto(mia)} {u}" if otro else None
+        else:
+            otro = [n for n, r, _, nota in filas if not nota and r] + sin_clon + \
+                   [r for r, _ in d["solo_alla"] + d["nuevo_alla"]]
+            vuelta = f"flota pasar {u} {corto(mia)}" if otro else None
+        if vuelta:
+            print(AVISO(f"  en la otra dirección sí hay: {', '.join(otro[:4])}{'…' if len(otro) > 4 else ''}. "
+                        f"Para eso: {vuelta}" + ("  (o solo las ramas: flota traer .)" if not viene else "")))
+        return
+    raiz = raiz_de(mia) if os.path.isdir(mia) else mia
+    if raiz != mia:
+        partes.append(f"lo que sigue git en {corto(raiz)} no va: eso es flota "
+                      + ("traer" if viene else "entregar") + f" {corto(raiz)}")
+    for x in partes:
+        print("  " + x)
+    if not si("  ¿Sigo?"):
+        sys.exit("flota: no pasé nada")
+    # repos first: their files are git's, and the loose list leaves them out
+    for nombre, _ in repos:
+        repo = mia if os.path.isdir(os.path.join(mia, ".git")) else os.path.join(mia, nombre)
+        if viene:
+            traer(repo)
+        else:
+            subprocess.run([os.path.join(AQUI, "sistema", "entregar-repo"), u, repo,
+                            "--name", os.path.relpath(repo, CLONES), "--go"])
+    if viene:
+        for r in sin_clon:
+            rel = os.path.relpath(os.path.join(suya, r), f"{CASAS}/{u}/work")
+            clonar_uno([u, rel, os.path.join(mia, r)])
+    if enviar:
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".lista", delete=False) as f:
+            f.write("".join(rel + "\n" for rel, _ in enviar))
+            lista = f.name
+        try:
+            rs = ["rsync", "-a", "--mkpath", "--no-owner", "--no-group", "--update",
+                  f"--files-from={lista}", de + "/"]
+            rs += [a + "/"] if viene else [LEGIBLE, "-e", RSH, f"{u}:{a}/"]
+            r = subprocess.run(rs).returncode
+        finally:
+            os.unlink(lista)
+        print(OK(f"  {len(enviar)} archivo(s) suelto(s) copiados") if r == 0 else AVISO(f"  rsync: salió con {r}"))
+    if sobran or vacias:
+        borrar_en(u, de, a, viene, [r for r, _ in sobran], vacias)
+
+
+
+def carpetas_que_sobran(origen, destino, sobran):
+    """The folders under destino that origen lacks and that hold nothing once `sobran`
+    (the files --borrar deletes) are gone, deepest first; never in a .git. A folder
+    with anything else in it stays, and rsync deletes a folder only when it is empty."""
+    borra, fuera = {r for r, _ in sobran}, set()
+    for raiz, dirs, archivos in os.walk(destino, topdown=False):
+        rel = os.path.relpath(raiz, destino)
+        if rel == "." or ".git" in rel.split(os.sep) or os.path.lexists(os.path.join(origen, rel)):
+            continue
+        if all(os.path.join(rel, x) in borra for x in archivos) and \
+           all(os.path.join(rel, x) in fuera for x in dirs):
+            fuera.add(rel)
+    return sorted(fuera, key=lambda r: (-r.count(os.sep), r))
+
+
+def borrar_en(u, de, a, viene, archivos, carpetas):
+    """Delete at the destination exactly the listed paths, none of which is at the origin:
+    rsync --delete-missing-args turns each into a deletion, and a folder only when empty.
+    Files first, then folders a level at a time, deepest first (rsync sorts its list).
+    That the paths and their folders are missing at the origin is the point, so its
+    "vanished" and "parent dir is absent" notes are not shown, nor its exit 24."""
+    import tempfile
+    tandas = [archivos] + [[c for c in carpetas if c.count(os.sep) == n]
+                           for n in sorted({c.count(os.sep) for c in carpetas}, reverse=True)]
+    mal = []
+    for tanda in (t for t in tandas if t):
+        with tempfile.NamedTemporaryFile("w", suffix=".lista", delete=False) as f:
+            f.write("".join(rel + "\n" for rel in tanda))
+            lista = f.name
+        try:
+            rs = ["rsync", "-a", "--delete-missing-args", f"--files-from={lista}", de + "/"]
+            rs += [a + "/"] if viene else ["-e", RSH, f"{u}:{a}/"]
+            r = subprocess.run(rs, stderr=subprocess.PIPE, text=True)
+        finally:
+            os.unlink(lista)
+        otras = [l for l in r.stderr.splitlines()
+                 if not re.search(r"file has vanished|parent dir is absent|some files vanished", l)]
+        sys.stderr.write("".join(l + "\n" for l in otras))
+        if r.returncode not in (0, 24) or otras:
+            mal.append(r.returncode)
+    print(AVISO(f"  rsync, al borrar: salió con {mal}") if mal else
+          OK(f"  borrados: {len(archivos)} archivo(s)" + (f", {len(carpetas)} carpeta(s)" if carpetas else "")))
+
+
+def pasar(origen, destino, borrar=False, arbol=None):
+    """flota pasar: rsync, one way, between you and the AI users or between them. As cp,
+    a destination folder that exists gets the thing inside it, unless it bears the
+    origin's name: then it is the copy, brought up to date. Several origins, or --arbol,
+    go inside the destination, which is then always a folder. Shown first, then asked."""
+    if isinstance(origen, list) and len(origen) == 1 and not arbol:
+        origen = origen[0]
+    if isinstance(origen, list) or arbol:
+        return pasar_varios(origen if isinstance(origen, list) else [origen], destino, borrar, arbol)
+    u_o, _, src = lugar(origen)
+    u_d, base, dst = lugar(destino)
+    lados(u_o, u_d)
+    if not os.path.exists(src):
+        sys.exit(f"flota: {src} does not exist")
+    con_repos(src, origen, u_o, u_d)
+    archivo = os.path.isfile(src)
+    carpeta = destino.endswith("/") or (archivo and not os.path.exists(dst))   # a folder to put it in
+    adentro = (carpeta or os.path.isdir(dst)) and os.path.basename(dst) != os.path.basename(src)
+    final = os.path.join(dst, os.path.basename(src)) if adentro else dst
+    if archivo and os.path.basename(final) != os.path.basename(src):
+        sys.exit("flota: a file keeps its name: give a folder as the destination")
+    if u_d:
+        dentro(final, base)
+    confidencial(u_o, u_d, [src])
+    origen_rs = src if archivo else src + "/"
+    hacia = os.path.dirname(final) + "/" if archivo else final + "/"
+    rsync_y_preguntar([origen_rs], hacia, u_d, borrar, [],
+                      [f"{src}  ->  {(u_d + ':') if u_d else ''}{final}"],
+                      os.path.dirname(final) if archivo else final)
+
+
+def pasar_varios(origenes, destino, borrar, arbol):
+    """Several origins into one destination folder, each by its name; with --arbol RAIZ,
+    each at its path under RAIZ (rsync -R), so folders from different points of a tree
+    land at the same points of the copy."""
+    lugares = [lugar(o) for o in origenes]
+    u_o = lugares[0][0]
+    if any(l[0] != u_o for l in lugares):
+        sys.exit("flota: the origins are all yours, or all of one AI user")
+    u_d, base, dst = lugar(destino)
+    lados(u_o, u_d)
+    if u_d:
+        dentro(dst, base, raiz_ok=True)
+    srcs = [l[2] for l in lugares]
+    for src, o in zip(srcs, origenes):
+        if not os.path.exists(src):
+            sys.exit(f"flota: {src} does not exist")
+        con_repos(src, o, u_o, u_d)
+    if arbol:
+        u_r, _, raiz = lugar(arbol)
+        if u_r != u_o:
+            sys.exit("flota: --arbol is on the same side as the origins")
+        rels = [os.path.relpath(src, raiz) for src in srcs]
+        if any(r == "." or r.startswith("..") for r in rels):
+            sys.exit(f"flota: every origin goes inside --arbol {raiz}")
+        envio = [f"{raiz}/./{r}" for r in rels]                    # -R keeps what follows /./
+        llegan = [os.path.join(dst, r) for r in rels]
+    else:
+        nombres = [os.path.basename(src) for src in srcs]
+        if len(set(nombres)) < len(nombres):
+            sys.exit("flota: two origins have the same name; with --arbol each keeps its path")
+        envio = srcs
+        llegan = [os.path.join(dst, n) for n in nombres]
+    confidencial(u_o, u_d, srcs)
+    rsync_y_preguntar(envio, dst + "/", u_d, borrar, ["--relative"] if arbol else [],
+                      [f"{s}  ->  {(u_d + ':') if u_d else ''}{l}" for s, l in zip(srcs, llegan)], dst)
+
+
+def con_repos(src, origen, u_o, u_d):
+    """A folder with repos goes by flota pasar ORIGEN alone (repos by git, to their one
+    fleet), and never from one fleet to another: that is flota mover."""
+    if os.path.isdir(src) and tiene_repos(src):
+        if u_o and u_d:
+            sys.exit(f"flota: {src} tiene repos, y un proyecto vive en una sola flota: "
+                     f"para pasárselo a {u_d}, flota mover {origen} {u_d}")
+        if u_o:                                         # from its fleet: to your copy, same path
+            rel = os.path.relpath(src, f"{CASAS}/{u_o}/work")
+            sys.exit(f"flota: {src} tiene repos, y un proyecto viene a tu copia en el mismo camino: "
+                     f"flota pasar {u_o}:{rel} ~/agents/{rel}")
+        rel = os.path.relpath(os.path.realpath(src), os.path.realpath(CLONES))
+        if rel.startswith(".."):
+            sys.exit(f"flota: {src} tiene repos, y un proyecto con repos va entre su flota y tu copia en "
+                     f"{CLONES}, en el mismo camino: movelo a {CLONES}/{os.path.basename(src)} y, "
+                     f"parado ahí, flota pasar . {u_d}")
+        sys.exit(f"flota: {src} tiene repos, y un proyecto va al mismo camino en su flota: "
+                 f"parado en {corto(src)}, flota pasar . {hacia}")
+
+
+def lados(u_o, u_d):
+    if not u_o and not u_d:
+        sys.exit("flota: one side is an AI user's (`claude:x`, `pensadero`); for your own files, rsync")
+    if u_o and u_o == u_d:
+        sys.exit(f"flota: both sides are {u_o}'s")
+
+
+def dentro(ruta, base, raiz_ok=False):
+    rel = os.path.relpath(ruta, base)
+    if rel.startswith("..") or (rel == "." and not raiz_ok):
+        sys.exit(f"flota: {ruta} is not inside {base}")
+
+
+def confidencial(u_o, u_d, srcs):
+    if u_o and pensadero(u_o) and u_d:
+        print(AVISO(", ".join(srcs) + " es del pensadero: confidencial, lo que pensás."))
+        if not si(f"¿Se lo paso a {u_d} igual?"):
+            sys.exit("flota: no lo pasé")
+
+
+def rsync_y_preguntar(envio, hacia, u_d, borrar, extra, cabecera, hasta):
+    """One rsync for all: a dry run shows what changes, then asks, then copies. The
+    folders the destination lacks are made (--mkpath), as whoever writes there."""
+    rs = ["rsync", "-a", "--mkpath", "--no-owner", "--no-group", "--exclude=.git",
+          "--exclude=.claude/*.lock", *([LEGIBLE] if u_d else []), "--itemize-changes",
+          *extra, *(["--delete"] if borrar else []), *(["-e", RSH] if u_d else []),
+          *envio, f"{u_d}:{hacia}" if u_d else hacia]           # you read the origin; only its writer is the AI user
+    r = subprocess.run(rs[:1] + ["-n"] + rs[1:], capture_output=True, text=True)
+    # rsync's own lines say what failed; its last one only says that something did
+    errores = [l for l in r.stderr.splitlines() if l.strip() and not l.startswith("rsync error:")]
+    if r.returncode == 23 and errores:                      # some files: the rest can go
+        print(AVISO(f"  rsync no puede con {len(errores)} (quedan fuera):"))
+        for l in errores[:10]:
+            print(AVISO("    " + l))
+        if len(errores) > 10:
+            print(TENUE(f"    … y {len(errores) - 10} más"))
+    elif r.returncode != 0:
+        sys.exit("flota: rsync:\n  " + "\n  ".join((errores or r.stderr.strip().splitlines() or ["?"])[:10]))
+    lineas = [l for l in r.stdout.splitlines() if l.strip()]
+    crea = [l for l in lineas if l.startswith("created ")]                     # --mkpath's folders
+    cambios = [l for l in lineas if l not in crea and not l.startswith(".d")]
+    for c in cabecera:
+        print(c)
+    if any(" directories for " in l for l in crea):                           # more than the last one
+        print(TENUE(f"  crea las carpetas que faltan hasta {hasta}"))
+    if not cambios:
+        print(OK("ya está igual: nada que pasar"))
+        return
+    for l in cambios[:40]:
+        print("  " + (AVISO(l) if l.startswith("*deleting") else l))
+    if len(cambios) > 40:
+        print(TENUE(f"  … y {len(cambios) - 40} más"))
+    borra = sum(1 for l in cambios if l.startswith("*deleting"))
+    if not si(f"¿Paso {len(cambios) - borra} cambio(s)" + (f" y borro {borra}" if borra else "")
+              + ("?" if borrar else "? (no borra nada)"), defecto=not borra):
+        return
+    fin = subprocess.run(rs, stderr=subprocess.PIPE, text=True)
+    errores = [l for l in fin.stderr.splitlines() if l.strip() and not l.startswith("rsync error:")]
+    if fin.returncode == 23 and errores:       # a dry run does not open files: told only now
+        print(AVISO(f"  pasó lo demás; rsync no pudo con {len(errores)}:"))
+        for l in errores[:10]:
+            print(AVISO("    " + l))
+        if len(errores) > 10:
+            print(TENUE(f"    … y {len(errores) - 10} más"))
+    elif errores:
+        sys.stderr.write("".join(l + "\n" for l in errores))
+    sys.exit(fin.returncode)
+
+
+def entregar(agente, ruta, nombre=None):
+    """One clone, or every repo in a folder of related repos, which the agent gets in
+    a folder of the same name: ~/agents/rc/a -> ~/work/rc/a."""
+    ruta = os.path.realpath(os.path.expanduser(ruta))
+    lista = clones(ruta)
+    grupo = None if lista == [ruta] else (nombre or os.path.basename(ruta))
+    if grupo:
+        print(f"{grupo}: {len(lista)} repos -> ~{agente}/work/{grupo}/: "
+              + ", ".join(os.path.basename(r) for r in lista))
+        if not si("¿Los entrego?", defecto=True):
+            return
+    peor = 0
+    for repo in lista:
+        extra = (["--name", f"{grupo}/{os.path.basename(repo)}"] if grupo
+                 else ["--name", nombre] if nombre else [])
+        r = subprocess.run([os.path.join(AQUI, "sistema", "entregar-repo"), agente, repo, *extra, "--go"])
+        peor = peor or r.returncode
+    sys.exit(peor)
+
+
+# What `flota estado` asks each AI user, as that user (its own /proc and folders):
+# S| a live session (claude or codex on a terminal): pid, program, folder, seconds alive
+# F| a folder in ~/work: name, newest change (epoch) three levels down, and
+#    "repo" if it is a git repository, "grupo" if repositories sit inside it
+# C| codex's newest session file (its last activity)
+ESTADO_SH = r"""
+cd /
+ps -u "$(id -un)" -o pid=,comm=,tty=,etimes= | while read -r pid comm tty et; do
+  case $comm in claude|codex) [ "$tty" = "?" ] || printf 'S|%s|%s|%s|%s\n' "$pid" "$comm" "$(readlink /proc/$pid/cwd)" "$et" ;; esac
+done
+for d in "$HOME"/work/*/; do
+  [ -d "$d" ] || continue
+  t=$(find "$d" -maxdepth 3 -not -path '*/.git/*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  g=""; [ -e "$d.git" ] && g=repo
+  [ -z "$g" ] && ls -d "$d"*/.git >/dev/null 2>&1 && g=grupo
+  printf 'F|%s|%s|%s\n' "${d%/}" "${t%.*}" "$g"
+done
+[ -d "$HOME/.codex/sessions" ] && printf 'C|%s\n' "$(find "$HOME/.codex/sessions" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)"
+for p in $(pgrep -u "$(id -u)" -f '/home/agents/bin/buzon despertador'); do printf 'D|%s\n' "$p"; done
+true
+"""
+
+
+def hace(segundos):
+    """5 min, 3 h, 2 d: how long ago, short."""
+    m = int(segundos) // 60
+    return f"{m} min" if m < 60 else f"{m // 60} h" if m < 48 * 60 else f"{m // 1440} d"
+
+
+def tabla(cabecera, filas, opcional=None):
+    """A table under a header row, each column as wide as its longest cell. When it does
+    not fit the screen (a phone), the column `opcional` (an index) is left out."""
+    if not filas:
+        return
+    cols = list(range(len(cabecera)))
+    def ancho(c):
+        return max(len(str(f[c])) for f in [cabecera] + filas)
+    if opcional is not None and 4 + sum(ancho(c) + 2 for c in cols) > shutil.get_terminal_size((100, 24)).columns:
+        cols.remove(opcional)
+    def linea(f):
+        return "    " + "  ".join(str(f[c]).ljust(ancho(c)) for c in cols).rstrip()
+    print(TENUE(linea(cabecera)))
+    for f in filas:
+        print(linea(f))
+
+
+def estado():
+    """Each AI user at a glance. Reads only; nothing is changed or started."""
+    cfg = instalado()
+    usuarios = cfg.get("ai_users", {})
+    if not usuarios:
+        sys.exit("flota: cannot read the installed fleet.toml")
+    ahora = time.time()
+    rc, out, _ = correr([BUZON, "listar", "--sin-respuesta"])
+    pendientes = re.findall(r"(?m)^[ *] \S+\n\s+\S+ -> (\S+)", out) if rc == 0 else []
+    for u, a in usuarios.items():
+        roles = a.get("roles", [])
+        pv = a.get("providers", [a.get("provider", "?")])
+        cajas = [n for n, c in cfg.get("cluster", {}).items() if u in c.get("box", {})]
+        banda(f"{u}  ·  {', '.join(pv)}  ·  {', '.join(roles) or 'sin rol'}")
+        print(TENUE(f"  clusters: {', '.join(cajas) or 'ninguno'}"))
+        rc, out, err = como(u, "sh", "-c", ESTADO_SH)
+        if rc != 0:
+            print(AVISO(f"  no pude preguntarle a {u}: {(err.strip().splitlines() or ['?'])[-1]}"))
+            continue
+        filas = [l.split("|") for l in out.splitlines() if "|" in l]
+        info = {}
+        if "claude" in pv:
+            rc2, js, _ = como(u, "/home/agents/bin/fleetcontext", "--json")
+            if rc2 == 0:
+                try:
+                    info = {s["pid"]: s for s in json.loads(js)}
+                except (ValueError, KeyError, TypeError):
+                    info = {}
+        sesiones = [f for f in filas if f[0] == "S"]
+        print(TITULO(f"  sesiones vivas: {len(sesiones)}"))
+        vistas = []
+        for _, pid, prog, cwd, et in sesiones:
+            s = info.get(int(pid), {})
+            vistas.append((s.get("session") or prog, cwd.replace(f"/home/{u}", "~"),
+                           f"{s['idle_minutes']} min" if "idle_minutes" in s else "?",
+                           f"{s['tokens'] // 1000}k" if "tokens" in s else "?", hace(et)))
+        tabla(("sesión", "carpeta", "quieta", "contexto", "abierta"), vistas, opcional=1)
+        if "codex" in pv:
+            desp = [f[1] for f in filas if f[0] == "D"]
+            print(TENUE(f"  despertador: corre (pid {', '.join(desp)})") if desp else
+                  AVISO(f"  despertador: no corre; sus sesiones atentas no se despiertan (flota arrancar {u})"))
+        ultima = [f for f in filas if f[0] == "C" and f[1]]
+        if ultima:
+            print(TENUE(f"    codex: última actividad hace {hace(ahora - int(ultima[0][1]))}"))
+        carpetas = sorted((f for f in filas if f[0] == "F"), key=lambda f: -int(f[2] or 0))
+        if carpetas:
+            print(TITULO(f"  carpetas en ~/work: {len(carpetas)}"))
+            tabla(("carpeta", "cambió", "git"),
+                  [(os.path.basename(d), hace(ahora - int(t)) if t else "?", g)
+                   for _, d, t, g in carpetas[:12]])
+            if len(carpetas) > 12:
+                print(TENUE(f"    … y {len(carpetas) - 12} más"))
+        n = sum(1 for p in pendientes if p.split(",")[0].split("/")[0] == u)
+        print(f"  buzón: {n} pedido(s) o propuesta(s) sin responder" if n else TENUE("  buzón: nada sin responder"))
+
+
+# ---- flota estado <carpeta>: your copy against the fleet's --------------------------
+# A project lives in one fleet: ~/agents/<path> has one
+# counterpart, <fleet>:<path>. Its repos are compared by git, from your clones (never
+# running git in the agent's repo); everything else, file by file, outside every .git
+# and every file git follows on either side.
+
+GRANDE = 1 << 30           # 1 GB: a file this big is named apart before it travels
+
+
+def par(texto, nueva=None):
+    """(AI user, your folder, its folder) for a place: `.` or a path of yours under
+    ~/agents (its fleet deduced), or <user>:<path> (your side is ~/agents/<path>).
+    nueva: the fleet you named, for a project no fleet has yet."""
+    usuarios = instalado().get("ai_users", {})
+    u, sep, rel = texto.partition(":")
+    if u in usuarios and sep:
+        rel = rel.strip("/")
+        if not rel or ".." in rel.split("/"):
+            sys.exit(f"flota: {texto}: name a folder inside its ~/work")
+        return u, os.path.join(CLONES, rel), f"{CASAS}/{u}/work/{rel}"
+    mia = os.path.realpath(os.path.expanduser(texto))
+    rel = os.path.relpath(mia, os.path.realpath(CLONES))
+    if rel == "." or rel.startswith(".."):
+        sys.exit(f"flota: {mia} is not a folder inside {CLONES}: say whose it is, <user>:<path>")
+    # the fleet: whoever has this path, or the nearest folder above it (a subfolder may be
+    # new there), or the repos in it or around it
+    tienen, arriba = [], rel
+    while arriba and not tienen:
+        tienen = [u for u in usuarios if os.path.isdir(f"{CASAS}/{u}/work/{arriba}")]
+        arriba = os.path.dirname(arriba)
+    lista = clones(mia) or ([raiz_de(mia)] if raiz_de(mia) != mia else [])
+    repos, _ = duenos(lista) if lista else ({}, [])
+    tienen = sorted(set(tienen) | set(repos)) or ([nueva] if nueva else [])
+    if not tienen:
+        sys.exit(f"flota: no fleet has {rel} yet: name it, <user>:{rel}")
+    if len(tienen) > 1:
+        sys.exit(f"flota: {rel} is in {' and '.join(tienen)}: a project lives in one fleet. "
+                 f"Name one ({tienen[0]}:{rel}), or leave one with flota mover")
+    return tienen[0], mia, f"{CASAS}/{tienen[0]}/work/{rel}"
+
+
+def seguidos(mia, u):
+    """Paths (relative to mia) that git follows in its repos: your main, and every
+    branch of u's you have fetched. Your clone answers; the agent's repo is not run."""
+    out = set()
+    raiz = raiz_de(mia)
+    if raiz != mia:                                   # a subfolder of a repo: its tracked paths too
+        dentro = os.path.relpath(mia, raiz) + "/"
+        for ref in [principal(raiz) or "HEAD"] + [r for r in git(raiz, "for-each-ref", "--format=%(refname:short)",
+                                                                   f"refs/remotes/{u}/")[1].split() if r]:
+            rc, txt = git(raiz, "ls-tree", "-r", "--name-only", ref, "--", dentro)
+            if rc == 0:
+                out |= {l[len(dentro):] for l in txt.splitlines() if l.startswith(dentro)}
+    for repo in clones(mia):
+        pre = os.path.relpath(repo, mia)
+        pre = "" if pre == "." else pre + "/"
+        refs = [principal(repo) or "HEAD"] + [r for r in git(repo, "for-each-ref", "--format=%(refname:short)",
+                                                               f"refs/remotes/{u}/")[1].split() if r]
+        for ref in refs:
+            rc, txt = git(repo, "ls-tree", "-r", "--name-only", ref)
+            if rc == 0:
+                out |= {pre + l for l in txt.splitlines() if l}
+    return out
+
+
+# What an AI user's copy must be: readable by its group (the human is in it), whatever
+# mode the origin had; a file of the human's kept at 600 would otherwise come back
+# unreadable to them (2026-11-16).
+LEGIBLE = "--chmod=Dg+rx,Fg+r"
+
+
+def de_sesion(rel):
+    """A session's own working file, never the project's: a lock under .claude/."""
+    partes = rel.split("/")
+    return len(partes) >= 2 and partes[-2] == ".claude" and partes[-1].endswith(".lock")
+
+
+def arbol(raiz, fuera):
+    """{relative path: (size, mtime)} of the files under raiz, outside every .git, every
+    repo's tracked files (fuera) and the folders that could not be read (listed apart)."""
+    archivos, ilegibles = {}, []
+    def error(e):
+        ilegibles.append(os.path.relpath(e.filename, raiz))
+    for d, dirs, fs in os.walk(raiz, onerror=error):
+        dirs[:] = sorted(x for x in dirs if x != ".git")
+        for f in fs:
+            if f == ".git":
+                continue
+            ruta = os.path.join(d, f)
+            rel = os.path.relpath(ruta, raiz)
+            if rel in fuera or de_sesion(rel):
+                continue
+            try:
+                st = os.lstat(ruta)
+            except OSError:
+                ilegibles.append(rel)
+                continue
+            archivos[rel] = (st.st_size, int(st.st_mtime))
+    return archivos, ilegibles
+
+
+def sueltos(mia, suya, fuera):
+    """How the loose files of the two sides differ, as rsync's quick check sees it
+    (size and modification time): only here, only there, newer here, newer there."""
+    aca, ilegibles_aca = arbol(mia, fuera) if os.path.isdir(mia) else ({}, [])
+    alla, ilegibles_alla = arbol(suya, fuera) if os.path.isdir(suya) else ({}, [])
+    d = {"solo_aca": [], "solo_alla": [], "nuevo_aca": [], "nuevo_alla": []}
+    for rel in sorted(set(aca) | set(alla)):
+        a, b = aca.get(rel), alla.get(rel)
+        if a and not b:
+            d["solo_aca"].append((rel, a[0]))
+        elif b and not a:
+            d["solo_alla"].append((rel, b[0]))
+        elif a != b:
+            d["nuevo_aca" if a[1] >= b[1] else "nuevo_alla"].append((rel, max(a[0], b[0])))
+    d["ilegibles"] = ilegibles_aca + ilegibles_alla
+    return d
+
+
+def resumen_repos(mia, u, traer_antes=True):
+    """For each repo in mia: the branches of u's not in your main (after a fetch, unless
+    traer_antes is False), and how many commits of your main u has not got."""
+    filas = []
+    for repo in clones(mia):
+        nombre = os.path.relpath(repo, mia)
+        nombre = os.path.basename(repo) if nombre == "." else nombre
+        remotos = remotos_de_agentes(repo)
+        if u not in remotos:
+            filas.append((nombre, None, None, f"{u} no lo tiene"))
+            continue
+        if traer_antes:
+            git(repo, "fetch", "-q", u)
+        base = principal(repo) or "HEAD"
+        ramas = [(r, int(git(repo, "rev-list", "--count", f"{base}..{r}")[1] or 0))
+                 for r in ramas_nuevas(repo, u, base)]
+        falta = int(git(repo, "rev-list", "--count", base, "--not", f"--remotes={u}/*")[1] or 0)
+        filas.append((nombre, ramas, falta, None))
+    return filas
+
+
+def tamano(n):
+    for u, f in (("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)):
+        if n >= f:
+            return f"{n / f:.1f} {u}".replace(".", ",")
+    return f"{n} B"
+
+
+def estado_carpeta(texto, traer_antes=True, viene=None, nueva=None):
+    """flota estado <carpeta>: your copy against the fleet's, changing nothing in either
+    (the fetch only updates what your clone knows of the agent's branches)."""
+    u, mia, suya = par(texto, nueva)
+    flecha = "↔" if viene is None else ("←" if viene else "→")      # estado compares; pasar goes one way
+    print(TITULO(f"{corto(mia)}  {flecha}  {u}:{os.path.relpath(suya, f'{CASAS}/{u}/work')}"
+                 + ("" if viene is None else TENUE("   (" + (f"de {u} a vos" if viene else f"de vos a {u}") + ")"))))
+    filas = resumen_repos(mia, u, traer_antes)
+    repos_alla = sorted(os.path.relpath(os.path.dirname(g), suya)
+                        for g in glob.glob(os.path.join(suya, "**", ".git"), recursive=True))
+    sin_clon = [r for r in repos_alla if not os.path.isdir(os.path.join(mia, r, ".git"))]
+    if filas or sin_clon:
+        print(TITULO(f"  repos: {len(filas) + len(sin_clon)}"))
+    for nombre, ramas, falta, nota in filas:
+        if nota:
+            print(f"    {nombre}: " + AVISO(nota))
+            continue
+        partes = [f"{len(ramas)} rama(s) para traer (" + ", ".join(f"{r.split('/', 1)[1]} +{n}" for r, n in ramas) + ")"
+                  if ramas else "nada para traer"]
+        if falta:
+            partes.append(f"tu main tiene {falta} commit(s) que {u} no tiene")
+        print(f"    {nombre}: " + "; ".join(partes))
+    for r in sin_clon:
+        print(f"    {r}: " + AVISO(f"está en {u} y no tenés clon (flota clonar {u} {r})"))
+    d = sueltos(mia, suya, seguidos(mia, u))
+    total = sum(len(d[k]) for k in ("solo_aca", "solo_alla", "nuevo_aca", "nuevo_alla"))
+    if not total:
+        print(OK("  archivos sueltos: iguales") if os.path.isdir(suya) and os.path.isdir(mia)
+              else TENUE("  archivos sueltos: ninguno"))
+    else:
+        print(TITULO(f"  archivos sueltos que difieren: {total}"))
+        for clave, texto_ in (("solo_aca", "solo tuyos"), ("nuevo_aca", "más nuevos acá"),
+                              ("solo_alla", f"solo en {u}"), ("nuevo_alla", f"más nuevos en {u}")):
+            if d[clave]:
+                peso = sum(n for _, n in d[clave])
+                print(f"    {len(d[clave]):>5} {texto_}  ({tamano(peso)})")
+                for rel, n in d[clave][:5]:
+                    print(TENUE(f"            {rel}") + (AVISO(f"  {tamano(n)}") if n >= GRANDE else ""))
+                if len(d[clave]) > 5:
+                    print(TENUE(f"            … y {len(d[clave]) - 5} más"))
+        grandes = [(r, n) for k in ("solo_aca", "solo_alla", "nuevo_aca", "nuevo_alla") for r, n in d[k] if n >= GRANDE]
+        if grandes:
+            print(AVISO(f"    {len(grandes)} de más de 1 GB: " + ", ".join(r for r, _ in grandes[:5])))
+    if d["ilegibles"]:
+        print(AVISO(f"  no pude leer {len(d['ilegibles'])}: " + ", ".join(d["ilegibles"][:5])))
+    return u, mia, suya, filas, d, sin_clon
+
+
+# ---- flota mover --------------------------------------------------------------------
+# A folder (a repo, a group of repos, or plain files) goes from one AI user to another,
+# and the origin goes to that AI user's TRASH, with a line in TRASH/README.md: nothing
+# is deleted. Repos keep their history in your clones under
+# ~/agents. Anything that could be lost stops it before it starts.
+
+def papelera(u):
+    """Where mover leaves what it took out of u: its ~/work/TRASH, a plain folder."""
+    return f"{CASAS}/{u}/work/TRASH"
+
+
+def repos_en(src):
+    """(repos, odd): src itself if it is a repo, else the repos directly inside it; odd
+    holds what mover will not handle: a repo deeper down, a .git that is a file (a
+    submodule or a worktree), a folder you cannot read."""
+    if os.path.isdir(os.path.join(src, ".git")):
+        return [src], []
+    repos, raros = [], []
+    for d, carpetas, archivos in os.walk(src, onerror=lambda e: raros.append(f"no puedo leer {e.filename}")):
+        if ".git" in archivos:
+            raros.append(f"{d}: su .git es un archivo (submódulo o worktree)")
+        if ".git" in carpetas:
+            (repos if os.path.dirname(d) == src else raros).append(
+                d if os.path.dirname(d) == src else f"{d}: un repo más adentro que el primer nivel")
+            carpetas[:] = []
+    return sorted(repos), raros
+
+
+def problemas_del_repo(u, repo, clon=None):
+    """What would be lost if repo left u's ~/work now. git runs as u, in u's repo. With
+    your clone (fetched just before), everything u has must be in your clone's main:
+    the agent need not have a main of its own, it gets yours as <you>/main. Without one,
+    its own main is what gets cloned, so its branches must be in it."""
+    g = binario("git")
+    def de(*args):
+        rc, out, _ = como(u, g, "-C", repo, *args)
+        return out.strip() if rc == 0 else None
+    p = []
+    sucio = de("status", "--porcelain")
+    if sucio is None or sucio:
+        p.append(f"tiene cambios sin commitear ({len(sucio.splitlines()) if sucio else '?'} archivo/s)")
+    if de("stash", "list"):
+        p.append("tiene un stash guardado")
+    ramas = [l.split() for l in (de("for-each-ref", "--format=%(refname:short) %(objectname)",
+                                    "refs/heads") or "").splitlines() if l.strip()]
+    if de("symbolic-ref", "-q", "HEAD") is None:              # detached: a commit of no branch
+        ramas.append(["HEAD", de("rev-parse", "HEAD") or "?"])
+    if clon:
+        base = principal(clon) or "main"
+        for rama, sha in ramas:
+            if git(clon, "merge-base", "--is-ancestor", sha, base)[0] != 0:
+                p.append(f"{rama} tiene commits que no están en tu {base} ({clon}): flota traer {clon}")
+        return p
+    base = next((b for b in ("main", "master") if b in (r for r, _ in ramas)), None)
+    if not base:
+        p.append("no tiene main (ni master), y no tenés un clon suyo: clonalo (flota clonar), "
+                 "aceptá su rama (git switch -c main) y volvé a correr mover")
+        return p
+    for rama, _ in ramas:
+        if rama not in (base, "HEAD"):
+            n = de("rev-list", "--count", f"{base}..{rama}")
+            if n != "0":
+                p.append(f"la rama {rama} tiene {n or '?'} commit(s) que no están en su main: "
+                         "clonalo (flota clonar) y traela (flota traer)")
+    return p
+
+
+def clon_de(u, repo):
+    """Your clone whose remote u reads repo, or None."""
+    for clon in clones():
+        for remoto, nombre in remotos_de_agentes(clon).items():
+            if remoto == u and f"{CASAS}/{u}/work/{nombre}" == repo:
+                return clon
+    return None
+
+
+# Every process of the AI user, with its folder: pid|name|cwd. Any process, not only the
+# sessions on a terminal that `flota estado` lists: codex's daemon has no terminal, and
+# a shell or a pdflatex working there would break as well (aparejador, 2026-10-20).
+PROCESOS_SH = r"""
+cd /
+for p in $(ps -u "$(id -un)" -o pid=); do
+  c=$(readlink "/proc/$p/cwd" 2>/dev/null) || continue
+  printf '%s|%s|%s\n' "$p" "$(cat "/proc/$p/comm" 2>/dev/null)" "$c"
+done
+"""
+
+
+def procesos_en(u, src):
+    """u's processes, of any kind, whose folder is src or inside it; None if u's
+    processes cannot be seen."""
+    rc, out, _ = como(u, "sh", "-c", PROCESOS_SH)
+    if rc != 0:
+        return None
+    return [f"{nombre} (pid {pid})" for pid, nombre, cwd in
+            (l.split("|", 2) for l in out.splitlines() if l.count("|") >= 2)
+            if cwd == src or cwd.startswith(src + "/")]
+
+
+def ahora_local():
+    """Now, in the human's time zone (fleet.toml), labelled."""
+    import datetime, zoneinfo
+    tz = instalado().get("human", {}).get("timezone") or "UTC"
+    try:
+        return datetime.datetime.now(zoneinfo.ZoneInfo(tz)), tz
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        return datetime.datetime.now(datetime.timezone.utc), "UTC"
+
+
+TRASH_LEEME = """# TRASH
+
+Lo que `flota mover` sacó de esta carpeta. Nada se borra solo: es de {humano}, que lo
+borra cuando quiere. Las sesiones no trabajan acá ni cambian nada.
+
+Para borrar una entrada: `sudo -u {u} rm -rf {trash}/<carpeta>`, y su renglón de abajo.
+
+"""
+
+
+def mover(origen, destino):
+    usuarios = instalado().get("ai_users", {})
+    u_o, base_o, src = lugar(origen)
+    u_d, base_d, dst = lugar(destino)
+    if not u_o or not base_o or not u_d or not base_d:
+        sys.exit("flota: mover va de un usuario IA a otro: flota mover codex:repo_clases pensadero")
+    if u_o == u_d:
+        sys.exit(f"flota: los dos lados son de {u_o}; dentro de un usuario IA, que lo mueva su sesión")
+    if src == base_o or not os.path.isdir(src):
+        sys.exit(f"flota: {src} no es una carpeta dentro de {base_o}")
+    if os.path.realpath(src).startswith(papelera(u_o)):
+        sys.exit(f"flota: {src} ya está en TRASH")
+    adentro = os.path.isdir(dst)
+    final = os.path.join(dst, os.path.basename(src)) if adentro else dst
+    rel_d = os.path.relpath(final, base_d)
+    rel_o = os.path.relpath(src, base_o)
+
+    banda(f"MOVER {u_o}:{rel_o}  ->  {u_d}:{rel_d}")
+    print()
+    problemas = []
+    if os.path.exists(final):
+        problemas.append(f"{u_d}:{rel_d} ya existe")
+    elif not os.path.isdir(os.path.dirname(final)):
+        problemas.append(f"{os.path.dirname(final)} no existe en {u_d}")
+    repos, raros = repos_en(src)
+    problemas += raros
+    abiertas = procesos_en(u_o, src)
+    if abiertas is None:
+        problemas.append(f"no pude ver los procesos de {u_o}")
+    elif abiertas:
+        problemas.append(f"hay procesos de {u_o} trabajando ahí: {', '.join(abiertas)}. "
+                         "Cerralos primero (las sesiones, su daemon, un shell abierto en esa carpeta)")
+    plan_clones = []                               # (repo, your clone, new?)
+    for repo in repos:
+        corto_r = os.path.relpath(repo, base_o)
+        clon = clon_de(u_o, repo)
+        if clon:
+            print(TENUE(f"  {corto_r}: git fetch {u_o} en {clon}"))
+            if git(clon, "fetch", "-q", u_o)[0] != 0:
+                problemas.append(f"{corto_r}: no pude traer de {u_o} a {clon}")
+        for p in problemas_del_repo(u_o, repo, clon):
+            problemas.append(f"{corto_r}: {p}")
+        if clon:
+            plan_clones.append((repo, clon, False))
+        else:
+            nuevo = os.path.join(CLONES, corto_r)
+            if os.path.exists(nuevo):
+                problemas.append(f"{corto_r}: {nuevo} ya existe y no es un clon de su repo")
+            plan_clones.append((repo, nuevo, True))
+    if problemas:
+        print(AVISO("  No muevo nada:"))
+        for p in problemas:
+            lineas = textwrap.wrap(p, ANCHO - 6, break_on_hyphens=False)
+            print("    - " + "\n      ".join(lineas))
+        sys.exit(1)
+
+    trash = papelera(u_o)
+    fecha, tz = ahora_local()
+    nombre = f"{fecha:%Y-%m-%d}-{os.path.basename(src)}"
+    n = 2
+    while os.path.exists(os.path.join(trash, nombre)):
+        nombre, n = f"{fecha:%Y-%m-%d}-{os.path.basename(src)}-{n}", n + 1
+
+    print(TITULO("  Qué hago:"))
+    for repo, clon, nuevo in plan_clones:
+        print(f"    - {os.path.relpath(repo, base_o)}: " + (f"lo clono en {clon} (su historia queda con vos)"
+              if nuevo else f"tu clon {clon} ya tiene todo su main"))
+    for repo, clon, _ in plan_clones:
+        print(f"    - le entrego tu main de {clon} a {u_d}")
+    if src not in repos:
+        print(f"    - lo que no es un repo, con rsync, a {u_d}:{rel_d}")
+    print(f"    - lo de {u_o} va a {trash}/{nombre}, con un renglón en su README.md")
+    if plan_clones:
+        print(f"    - saco el remoto {u_o} de tus clones: apuntaba a lo que se mueve")
+    if pensadero(u_o):
+        print(AVISO(f"  {src} es del pensadero: confidencial, lo que pensás."))
+    print()
+    if not si("¿Lo muevo?"):
+        sys.exit("flota: no moví nada")
+    try:
+        motivo = input("¿Por qué? Una línea para el README de TRASH (Enter: sin motivo): ").strip()
+    except EOFError:
+        motivo = ""
+
+    # 1. your clones: the history stays with you
+    for repo, clon, nuevo in plan_clones:
+        if nuevo:
+            rc, out, err = correr([sys.executable, os.path.join(AQUI, "sistema", "clonar.py"),
+                                   u_o, os.path.relpath(repo, base_o), clon])
+            if rc != 0 or subprocess.run(["bash", "-euc", out]).returncode != 0:
+                sys.exit(f"flota: no pude clonar {repo} en {clon}: no moví nada más\n{err.strip()}")
+    # 2. the destination
+    excluir = ["--exclude=.git"] + [f"--exclude=/{os.path.relpath(r, src)}/" for r in repos if r != src]
+    for repo, clon, _ in plan_clones:
+        sub = os.path.relpath(repo, src)
+        nombre_d = rel_d if sub == "." else f"{rel_d}/{sub}"
+        if subprocess.run([os.path.join(AQUI, "sistema", "entregar-repo"), u_d, clon,
+                           "--name", nombre_d, "--go"]).returncode != 0:
+            sys.exit(f"flota: no pude entregarle {clon} a {u_d}: lo de {u_o} sigue en su lugar")
+    if src not in repos:
+        rs = ["rsync", "-a", "--no-owner", "--no-group", LEGIBLE, *excluir, "-e", RSH, src + "/", f"{u_d}:{final}/"]
+        if subprocess.run(rs).returncode != 0:
+            sys.exit(f"flota: rsync falló: lo de {u_o} sigue en su lugar; revisá {u_d}:{rel_d}")
+    if not os.path.isdir(final):
+        sys.exit(f"flota: no encuentro {final}: lo de {u_o} sigue en su lugar")
+    # 3. the origin, to TRASH
+    renglon = (f"- {fecha:%Y-%m-%d %H:%M} ({tz}): `{nombre}/` era `{src}`; pasó a `{u_d}:{rel_d}` "
+               f"con `flota mover`" + (f". Motivo: {motivo}" if motivo else "") + ".")
+    leeme = TRASH_LEEME.format(humano=instalado().get("human", {}).get("name", "tu humano"),
+                               u=u_o, trash=trash)
+    rc, _, err = como(u_o, "sh", "-c",
+                      'mkdir -p "$1" && [ ! -e "$1/$2" ] && mv -T "$3" "$1/$2" '
+                      '&& { [ -e "$1/README.md" ] || printf "%s" "$4" > "$1/README.md"; } '
+                      '&& printf "%s\\n" "$5" >> "$1/README.md"',
+                      "sh", trash, nombre, src, leeme, renglon)
+    if rc != 0:
+        sys.exit(f"flota: ya está en {u_d}, pero no pude llevar lo de {u_o} a TRASH: {err.strip()}")
+    # 4. the old remote pointed at what moved
+    for repo, clon, _ in plan_clones:
+        git(clon, "remote", "remove", u_o)
+    print(OK(f"\nMovido: {u_d}:{rel_d}. Lo de {u_o} está en {trash}/{nombre}."))
+
+
+def cluster(nombre, agentes):
+    """clusters/add-cluster for each working AI user with a box on that cluster in the
+    installed fleet.toml (or the ones named): its plan first, then --go if you say so."""
+    bloque = instalado().get("cluster", {}).get(nombre)
+    if bloque is None:
+        sys.exit(f"flota: no [cluster.{nombre}] in /home/agents/etc/fleet/fleet.toml")
+    agentes = agentes or [u for u in de_trabajo() if u in bloque.get("box", {})]
+    if not agentes:
+        sys.exit(f"flota: no AI user has a box on {nombre} in fleet.toml")
+    add = os.path.join(AQUI, "clusters", "add-cluster")
+    peor = 0
+    for u in agentes:
+        banda(f"{nombre}: {u}")
+        print()
+        if subprocess.run([add, nombre, u]).returncode != 0:
+            peor = 1
+            continue
+        if si(f"  ¿Lo aplico en {nombre} para {u}?", defecto=True):
+            peor = peor or subprocess.run([add, nombre, u, "--go"]).returncode
+    sys.exit(peor)
+
+
+def clonar(args):
+    sys.exit(clonar_uno(args))
+
+
+def clonar_uno(args):
+    """clonar.py prints the commands for a safe clone; show them, and run them on a yes.
+    The exit status (0 when you said no)."""
+    rc, out, err = correr([sys.executable, os.path.join(AQUI, "sistema", "clonar.py"), *args])
+    if rc != 0:
+        print(AVISO((err or out).strip()))
+        return rc
+    if err.strip():
+        print(TENUE(err.strip()))
+    print(out)
+    if si("¿Corro estos comandos?"):
+        return subprocess.run(["bash", "-euc", out]).returncode
+    return 0
+
+
+INSTALADOR_CODEX = "https://chatgpt.com/codex/install.sh"
+
+
+def actualizar_codex():
+    """codex's daemon (`codex agents`) needs codex's own per-user package under
+    ~/.codex/packages, which the distribution's /usr/bin/codex lacks. So each agent
+    that runs codex gets the standalone install in its home, run AS the agent by sudo,
+    at the version fleet.toml fixes: a fixed version is not updated by itself, so a
+    new release cannot silently stop loading the rules. The script is downloaded once,
+    shown by its sha256, and fed to each agent's sh on stdin: the agent never reads a
+    file of yours."""
+    import hashlib, tempfile
+    cfg = instalado()
+    version = str(cfg.get("software", {}).get("codex", ""))
+    if not re.fullmatch(r"[0-9][0-9A-Za-z.+-]*", version):
+        sys.exit("flota: falta [software] codex = \"<versión>\" en tu fleet.toml (instalado con "
+                 "sistema/instalar). Ver la última: https://github.com/openai/codex/releases")
+    agentes = [u for u, a in cfg.get("ai_users", {}).items()
+               if "codex" in a.get("providers", [a.get("provider")])]
+    if not agentes:
+        sys.exit("flota: ningún agente de fleet.toml usa codex")
+    banda(f"CODEX {version} PARA: {', '.join(agentes)}")
+    print()
+    for u in agentes:
+        rc, out, _ = correr(["sudo", "-u", u, "-H", "sh", "-c",
+                             "~/.local/bin/codex --version 2>/dev/null || echo 'sin codex standalone'"], cwd="/")
+        print(f"  {u}: {out.strip() or '?'}")
+    with tempfile.TemporaryDirectory() as tmp:
+        script = os.path.join(tmp, "install.sh")
+        if subprocess.run(["curl", "-fsSL", INSTALADOR_CODEX, "-o", script]).returncode != 0:
+            sys.exit(f"flota: no pude bajar {INSTALADOR_CODEX}")
+        with open(script, "rb") as f:
+            datos = f.read()
+        lineas = datos.count(b"\n")
+        print(f"\n  instalador: {INSTALADOR_CODEX}\n  sha256 {hashlib.sha256(datos).hexdigest()}, "
+              f"{lineas} líneas (lo podés leer en otra terminal antes de seguir: {script})")
+        if not si(f"\n  ¿Instalo codex {version} para {', '.join(agentes)}?"):
+            return
+        for u in agentes:
+            print(TITULO(f"\n  {u}"))
+            with open(script, "rb") as f:
+                # cwd "/": the agent cannot enter your current folder, and the
+                # installer stumbles where it cannot
+                r = subprocess.run(["sudo", "-u", u, "-H", "env", f"CODEX_RELEASE={version}",
+                                    "CODEX_NON_INTERACTIVE=true", "sh", "-s"], stdin=f, cwd="/")
+            if r.returncode != 0:
+                print(AVISO(f"  falló para {u}: sigo con los demás"))
+    verificar_codex(agentes, cfg)
+
+
+def verificar_codex(agentes, cfg):
+    """Each agent's codex, started where it is started, must still load its rules:
+    the conventions for a working agent, the pensadero's conventions for the pensadero
+    (in its home; the maestro's brief adds itself in ~/maestro)."""
+    banda("¿SIGUEN CARGANDO SUS REGLAS?")
+    print()
+    for u in agentes:
+        pensadero = bool({"pensadero", "maestro"} & set(cfg["ai_users"][u].get("roles", [])))
+        marca = "# Convenciones del pensadero" if pensadero else "# Fleet conventions"
+        rc, out, err = correr(["sudo", "-u", u, "-H", "sh", "-c",
+                               "cd ~ && ~/.local/bin/codex --version && ~/.local/bin/codex debug prompt-input"], cwd="/")
+        version = out.splitlines()[0] if out else "?"
+        if rc == 0 and marca in out:
+            print(OK(f"  ok  {u}") + f"  {version}: carga {'las convenciones del pensadero' if pensadero else 'las convenciones'}")
+        else:
+            print(AVISO(f"  !!  {u}") + f"  {version}: no encontré «{marca}» en lo que codex le manda al modelo")
+            parrafo(f"No lo arranques hasta mirarlo: en t{u}, `codex debug prompt-input` "
+                    f"({(err.strip().splitlines() or ['sin error'])[-1]})", "        ")
+    print()
+    parrafo("Cuando todos tengan el standalone, podés desinstalar el codex de tu distribución "
+            "(por ejemplo `sudo pacman -R openai-codex`), así no hay dos según el PATH.", "  ", TENUE)
+
+
+# Typed by YOUR script, as the agent, into the pane of a session you said yes to:
+# the prompt is yours (conventions rule 2), and it only asks the session to read
+# its notes and wait for you.
+NUEVA = ("Te reinició {humano} con `flota reiniciar` para cargar las reglas instaladas: "
+         "arrancás sin la conversación anterior. Leé tus notas (AGENTS.md o RESUMEN.md, y lo que guardaste), "
+         "decime en dos líneas dónde estabas, y esperá: no empieces nada.")
+SEGUIDA = ("Te reinició {humano} con `flota reiniciar` para cargar las reglas instaladas, "
+           "con la misma conversación.")
+VIGILANTES = " Tus vigilantes murieron: corré `fleetwatch {s}` y volvé a armar lo que liste."
+
+
+def como(agente, *cmd):
+    return correr(["sudo", "-u", agente, "-H", *cmd], cwd="/")   # it cannot enter your folder
+
+
+def tmux(agente, *args):
+    return como(agente, binario("tmux"), *args)
+
+
+def ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def panel_de(pid, paneles):
+    """The tmux pane a process runs in: its own, or one of its ancestors'."""
+    while pid > 1:
+        if pid in paneles:
+            return paneles[pid]
+        pid = ppid(pid)
+    return None
+
+
+def borrador(agente, panel, prompt="\u276f"):
+    """What waits in the session's window: text typed and not sent, or a menu's choice
+    (a dimmed suggestion does not count). claude's prompt is ❯, codex's › (U+203A)."""
+    rc, out, _ = tmux(agente, "capture-pane", "-e", "-p", "-t", panel)
+    lineas = [l for l in out.splitlines() if prompt in l]
+    if rc or not lineas:
+        return None
+    resto = lineas[-1].split(prompt, 1)[1]
+    resto = re.sub(r"\x1b\[(?:3\d|39|0)?m", "", resto).replace("\xa0", " ").strip()
+    if not resto or resto.startswith("\x1b[2m"):
+        return None
+    return re.sub(r"\x1b\[[0-9;]*m", "", resto)
+
+
+def reiniciar(args):
+    """flota reiniciar [--seguir] [--forzar] [USUARIO...] [SESIÓN...]: the claude and codex
+    sessions of every AI user (the coordinator's user first), or of the users named, or
+    only the sessions named."""
+    seguir = "--seguir" in args
+    forzar = "--forzar" in args
+    resto = [a for a in args if a not in ("--seguir", "--forzar")]
+    usuarios_cfg = instalado().get("ai_users", {})
+    pedidos = [a for a in resto if a in usuarios_cfg]
+    nombres = [a for a in resto if a not in usuarios_cfg]
+    provee = lambda u: usuarios_cfg[u].get("providers") or [usuarios_cfg[u].get("provider", "claude")]
+    coord = coord_claude()
+    usuarios = sorted(pedidos or usuarios_cfg, key=lambda u: u != coord)
+    vistas = set()
+    for u in usuarios:
+        if "claude" in provee(u):
+            vistas |= reiniciar_usuario(u, nombres, seguir, forzar)
+        if "codex" in provee(u):
+            vistas |= reiniciar_codex(u, nombres, seguir, forzar)
+    faltan = set(nombres) - vistas
+    if faltan:
+        sys.exit(f"flota: ninguna sesión viva se llama {', '.join(sorted(faltan))}")
+
+
+# What `flota reiniciar` asks a codex AI user, as that user: its live codex sessions on a
+# terminal (pid, cwd, seconds running), and its rollouts' first line with their mtime.
+CODEX_SH = r"""
+cd /
+ps -u "$(id -un)" -o pid=,comm=,tty=,etimes= | while read -r pid comm tty et; do
+  [ "$comm" = codex ] && [ "$tty" != "?" ] && printf 'S|%s|%s|%s\n' "$pid" "$(readlink /proc/$pid/cwd)" "$et"
+done
+ls -t "$HOME"/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -300 | while read -r f; do
+  printf 'R|%s|' "$(stat -c %Y "$f")"; head -n 1 "$f" | head -c 20000; echo
+done
+[ -f "$HOME/.codex/session_index.jsonl" ] && tail -n 5000 "$HOME/.codex/session_index.jsonl" | sed 's/^/N|/'
+true
+"""
+
+
+def _buscar(d, clave):
+    """The first value of clave anywhere in a JSON object (codex nests session_meta)."""
+    if isinstance(d, dict):
+        if isinstance(d.get(clave), str):
+            return d[clave]
+        for v in d.values():
+            r = _buscar(v, clave)
+            if r:
+                return r
+    elif isinstance(d, list):
+        for v in d:
+            r = _buscar(v, clave)
+            if r:
+                return r
+    return None
+
+
+def sesiones_codex(agente, paneles=None):
+    """[{session, pid, cwd, thread, idle_minutes}] of an AI user's live codex sessions on
+    a terminal. A session's thread is the one whose name is the session's (its window's:
+    conventions rule 6; codex keeps names in ~/.codex/session_index.jsonl, the newest
+    entry winning), when paneles (tmux's, by pid) gives its window and exactly one thread
+    has that name. Else,
+    the newest rollout whose cwd is the session's (codex keeps no rollout open: the
+    aparejador, 2026-11-09); two in one folder share no thread: neither gets one."""
+    rc, out, err = como(agente, "sh", "-c", CODEX_SH)
+    if rc:
+        print(AVISO(f"flota: no pude preguntarle a {agente}: {(err.strip().splitlines() or ['?'])[-1]}"))
+        return []
+    vivas, rollouts, mtimes, nombre_de = [], {}, {}, {}
+    for l in out.splitlines():
+        if l.startswith("N|"):
+            try:
+                e = json.loads(l[2:])
+            except ValueError:
+                continue
+            if isinstance(e, dict) and isinstance(e.get("id"), str) and isinstance(e.get("thread_name"), str):
+                nombre_de[e["id"]] = e["thread_name"].strip()          # append-only: the last wins
+            continue
+        partes = l.split("|", 2) if l.startswith("R|") else l.split("|")
+        if partes[0] == "S" and len(partes) == 4:
+            vivas.append({"pid": int(partes[1]), "cwd": partes[2]})
+        elif partes[0] == "R" and len(partes) == 3:
+            try:
+                meta = json.loads(partes[2])
+            except ValueError:
+                continue
+            cwd, tid = _buscar(meta, "cwd"), _buscar(meta, "id")
+            if cwd and tid and re.fullmatch(r"[A-Za-z0-9-]+", tid):
+                mtimes.setdefault(tid, int(partes[1]))
+                if cwd not in rollouts:
+                    rollouts[cwd] = (tid, int(partes[1]))      # ls -t: the first is the newest
+    hilos_de = {}
+    for tid, n in nombre_de.items():
+        if re.fullmatch(r"[A-Za-z0-9-]+", tid):
+            hilos_de.setdefault(n, []).append(tid)
+    por_carpeta = {}
+    for v in vivas:
+        por_carpeta.setdefault(v["cwd"], []).append(v)
+    for v in vivas:
+        tid, mtime = rollouts.get(v["cwd"], (None, None))
+        v["thread"] = tid if len(por_carpeta[v["cwd"]]) == 1 else None
+        donde = panel_de(v["pid"], paneles) if paneles else None
+        por_nombre = hilos_de.get(donde[1].split(":", 1)[1], []) if donde else []
+        if len(por_nombre) == 1:                               # its name says which
+            v["thread"], mtime = por_nombre[0], mtimes.get(por_nombre[0])
+        v["idle_minutes"] = int((time.time() - mtime) // 60) if mtime else None
+    return vivas
+
+
+def reiniciar_codex(agente, nombres, seguir, forzar):
+    """Restart the codex sessions of one AI user (those named, if any), as claude's are:
+    shown, asked, /exit typed in their window, started again there (`codex "<aviso>"`,
+    or `codex resume <thread>` with --seguir). The names it has (the windows')."""
+    humano = instalado().get("human", {}).get("name") or "tu humano"
+    rc, out, _ = tmux(agente, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id} #{session_name}:#{window_name}")
+    paneles = {int(l.split()[0]): l.split()[1:] for l in out.splitlines() if l.strip()}
+    sesiones = sesiones_codex(agente, paneles)
+    if not sesiones:
+        sin_sesiones(agente, "codex")
+        return set()
+    for s_ in sesiones:
+        donde = panel_de(s_["pid"], paneles)
+        s_["donde"] = donde
+        s_["session"] = donde[1].split(":", 1)[1] if donde else os.path.basename(s_["cwd"])
+    tiene = {s_["session"] for s_ in sesiones}
+    if nombres:
+        sesiones = [s_ for s_ in sesiones if s_["session"] in nombres]
+    if not sesiones:
+        return tiene
+    sesiones.sort(key=lambda s_: (s_["session"] != "coord", s_["session"]))
+    banda(f"reiniciar sesiones de codex de {agente}: " + ("la misma conversación" if seguir else "de cero"))
+    for s_ in sesiones:
+        nombre, pid, donde = s_["session"], s_["pid"], s_["donde"]
+        print()
+        print(TITULO(f"  {nombre}") + TENUE(f"  {donde[1] if donde else 'sin ventana'}  ·  "
+              + (f"quieta hace {s_['idle_minutes']} min" if s_["idle_minutes"] is not None else "quieta ¿?")
+              + (f"  ·  {s_['thread']}" if s_["thread"] else "")))
+        if not donde:
+            print(AVISO("    no la encuentro en tmux: la dejo"))
+            continue
+        if s_["idle_minutes"] is None or s_["idle_minutes"] < 2:
+            if not forzar:
+                print(AVISO("    está trabajando, o no sé desde cuándo está quieta: la dejo (o con --forzar)"))
+                continue
+        if seguir and not s_["thread"]:
+            print(AVISO("    no sé cuál es su conversación (¿dos sesiones en la misma carpeta?): la dejo"))
+            continue
+        texto = borrador(agente, donde[0], prompt="\u203a")
+        if texto:
+            print(AVISO(f"    algo espera en su ventana ({texto[:40]!r}): la dejo; resolvelo antes"))
+            continue
+        if not si(f"    ¿Reinicio {nombre}?"):
+            continue
+        propio = pid in paneles
+        if propio:
+            tmux(agente, "set-option", "-p", "-t", donde[0], "remain-on-exit", "on")
+        tmux(agente, "send-keys", "-t", donde[0], "-l", "/exit")
+        tmux(agente, "send-keys", "-t", donde[0], "Enter")
+        for _ in range(120):
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.5)
+        else:
+            print(AVISO(f"    no salió en un minuto: miralo en {donde[1]}. Si muestra una pregunta "
+                        "(cerrar con tareas programadas, por ejemplo), contestala vos: sí la cierra, "
+                        "no la deja como estaba"))
+            if propio:
+                tmux(agente, "set-option", "-p", "-u", "-t", donde[0], "remain-on-exit")
+            continue
+        cmd = (["codex", "resume", s_["thread"], SEGUIDA.format(humano=humano)] if seguir
+               else ["codex", NUEVA.format(humano=humano)])
+        linea = "cd " + shlex.quote(s_["cwd"]) + " && " + " ".join(map(shlex.quote, cmd))
+        if propio:
+            tmux(agente, "respawn-pane", "-t", donde[0], "-c", s_["cwd"], linea)
+            tmux(agente, "set-option", "-p", "-u", "-t", donde[0], "remain-on-exit")
+        else:
+            tmux(agente, "send-keys", "-t", donde[0], "-l", linea)
+            tmux(agente, "send-keys", "-t", donde[0], "Enter")
+        print(OK(f"    reiniciada en {donde[1]}")
+              + ("" if seguir or not s_["thread"] else TENUE(f"  (la conversación anterior: codex resume {s_['thread']})")))
+    return tiene
+
+
+def usa_fleetcontext(agente):
+    """The fleet's tools (fleetcontext among them) are for the agents group: claude and
+    codex, not the pensadero (herramientas/install), which flota reiniciar asks itself."""
+    try:
+        return agente in grp.getgrnam("agents").gr_mem
+    except KeyError:
+        return False
+
+
+# What `flota reiniciar` asks an AI user without the fleet's tools (the pensadero), as
+# that user: its live claude sessions on a terminal (pid, cwd), and the newest transcript
+# of each one's folder (mtime, uuid): what fleetcontext gives the others, but tokens and
+# watchers (the pensadero has no clusters).
+CLAUDE_SH = r"""
+cd /
+ps -u "$(id -un)" -o pid=,comm=,tty= | while read -r pid comm tty; do
+  [ "$comm" = claude ] && [ "$tty" != "?" ] || continue
+  cwd=$(readlink /proc/$pid/cwd)
+  slug=$(printf '%s' "$cwd" | sed 's/[^A-Za-z0-9]/-/g')
+  t=$(ls -t "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null | head -n 1)
+  printf 'C|%s|%s|%s|%s
+' "$pid" "$(basename "$t" .jsonl)" "$( [ -n "$t" ] && stat -c %Y "$t")" "$cwd"
+done
+true
+"""
+
+
+def sesiones_claude(agente):
+    """fleetcontext's list for an AI user without the fleet's tools: each session is
+    named by its tmux window (`claude -n <name>` names both), else its folder. When two
+    share a folder, the transcript is not known: no uuid, so --seguir leaves them."""
+    rc, out, err = como(agente, "sh", "-c", CLAUDE_SH)
+    if rc:
+        print(AVISO(f"flota: no pude preguntarle a {agente}: {(err.strip().splitlines() or ['?'])[-1]}"))
+        return None
+    rc, panes, _ = tmux(agente, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id} #{session_name}:#{window_name}")
+    paneles = {int(l.split()[0]): l.split()[1:] for l in panes.splitlines() if l.strip()} if rc == 0 else {}
+    filas = [l.split("|", 4) for l in out.splitlines() if l.startswith("C|")]
+    carpetas = [f[4] for f in filas if len(f) == 5]
+    sesiones = []
+    for _, pid, uuid, mtime, cwd in (f for f in filas if len(f) == 5):
+        donde = panel_de(int(pid), paneles)
+        unica = carpetas.count(cwd) == 1
+        sesiones.append({"session": donde[1].split(":", 1)[1] if donde else os.path.basename(cwd),
+                         "pid": int(pid), "cwd": cwd, "tokens": None, "watchers": 0,
+                         "uuid": uuid if unica and re.fullmatch(r"[0-9a-f-]{36}", uuid) else None,
+                         "idle_minutes": int((time.time() - int(mtime)) // 60) if unica and mtime.isdigit() else None})
+    return sesiones
+
+
+def sin_sesiones(agente, herramienta):
+    """No session of that tool: after a power cut or a reboot, nothing runs until flota
+    arrancar."""
+    rc, _, _ = tmux(agente, "list-sessions")
+    print(TENUE(f"  {agente}: ninguna sesión de {herramienta} corriendo")
+          + (AVISO(" — su tmux no está corriendo: si la máquina se reinició, primero flota arrancar")
+             if rc else ""))
+
+
+def reiniciar_usuario(agente, nombres, seguir, forzar):
+    """Restart the claude sessions of one AI user (those named, if any); the names it has."""
+    humano = instalado().get("human", {}).get("name") or "tu humano"
+    if usa_fleetcontext(agente):
+        rc, out, err = como(agente, "/home/agents/bin/fleetcontext", "--json")
+        if rc:
+            print(AVISO(f"flota: fleetcontext failed as {agente}: {err.strip()}"))
+            return set()
+        sesiones = json.loads(out)
+    else:
+        sesiones = sesiones_claude(agente)
+        if sesiones is None:
+            return set()
+    tiene = {s["session"] for s in sesiones}
+    if not tiene:
+        sin_sesiones(agente, "claude")
+    if nombres:
+        sesiones = [s for s in sesiones if s["session"] in nombres]
+    if not sesiones:
+        return tiene
+    rc, out, _ = tmux(agente, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id} #{session_name}:#{window_name}")
+    paneles = {int(l.split()[0]): l.split()[1:] for l in out.splitlines() if l.strip()}
+    sesiones.sort(key=lambda s: (s["session"] not in ("coord", "maestro"), s["session"]))
+    banda(f"reiniciar sesiones de {agente}: " + ("con su conversación (-r)" if seguir else "de cero"))
+    parrafo("Escribo `/exit` en su ventana y la arranco de nuevo en el mismo lugar, con las reglas "
+            "instaladas. " + ("Sigue la misma conversación: el contexto no baja." if seguir else
+            "Arranca sin la conversación: que haya guardado antes lo pendiente. La anterior queda "
+            "en disco; te doy el `claude -r` para volver a ella."), "  ", TENUE)
+    for s in sesiones:
+        nombre, pid = s["session"], s["pid"]
+        donde = panel_de(pid, paneles)
+        print()
+        print(TITULO(f"  {nombre}") + TENUE(f"  {donde[1] if donde else 'sin ventana'}  ·  "
+              f"{round((s['tokens'] or 0) / 1000)}k  ·  quieta hace {s['idle_minutes']} min  ·  "
+              f"{s['watchers']} vigilante(s)"))
+        if not donde:
+            print(AVISO("    no la encuentro en tmux: la dejo"))
+            continue
+        if s["idle_minutes"] is None or s["idle_minutes"] < 2:
+            if not forzar:
+                print(AVISO("    está trabajando (activa hace menos de 2 min): la dejo; probá cuando "
+                            "termine, o con --forzar"))
+                continue
+            print(AVISO("    activa hace menos de 2 min: --forzar, la corto si está trabajando"))
+        texto = borrador(agente, donde[0])
+        if texto:
+            print(AVISO(f"    algo espera en su ventana (texto sin enviar o un menú: {texto[:40]!r}):"
+                        " la dejo; resolvelo antes"))
+            continue
+        if s["watchers"]:
+            print(AVISO("    sus vigilantes mueren con ella: le digo que corra fleetwatch al arrancar"))
+        rc_, prog, _ = como(agente, "sh", "-c",
+                            f"ls -d {shlex.quote(s['cwd'])}/.claude/scheduled_tasks* 2>/dev/null")
+        if prog.strip():
+            if not forzar:
+                print(AVISO("    tiene tareas programadas (/loop o /schedule): reiniciarla las corta, y "
+                            "claude pregunta si cerrar igual. La dejo; decidilo en su ventana, o "
+                            "--forzar (vas a tener que contestar vos esa pregunta)"))
+                continue
+            print(AVISO("    tiene tareas programadas: --forzar; claude te va a preguntar en su "
+                        "ventana si cerrar igual, y las corta si decís que sí"))
+        if not si(f"    ¿Reinicio {nombre}?"):
+            continue
+        propio = pid in paneles                       # claude is the pane's own process
+        if propio:
+            tmux(agente, "set-option", "-p", "-t", donde[0], "remain-on-exit", "on")
+        tmux(agente, "send-keys", "-t", donde[0], "-l", "/exit")
+        tmux(agente, "send-keys", "-t", donde[0], "Enter")
+        for _ in range(120):
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.5)
+        else:
+            print(AVISO(f"    no salió en un minuto: miralo en {donde[1]}. Si muestra una pregunta "
+                        "(cerrar con tareas programadas, por ejemplo), contestala vos: sí la cierra, "
+                        "no la deja como estaba"))
+            if propio:
+                tmux(agente, "set-option", "-p", "-u", "-t", donde[0], "remain-on-exit")
+            continue
+        aviso = ((SEGUIDA if seguir else NUEVA).format(humano=humano)
+                 + (VIGILANTES.format(s=nombre) if s["watchers"] else ""))
+        cmd = ["claude", "-n", nombre] + (["-r", s["uuid"]] if seguir and s["uuid"] else []) + [aviso]
+        linea = "cd " + shlex.quote(s["cwd"]) + " && " + " ".join(map(shlex.quote, cmd))
+        if propio:
+            tmux(agente, "respawn-pane", "-t", donde[0], "-c", s["cwd"], linea)
+            tmux(agente, "set-option", "-p", "-u", "-t", donde[0], "remain-on-exit")
+        else:
+            tmux(agente, "send-keys", "-t", donde[0], "-l", linea)
+            tmux(agente, "send-keys", "-t", donde[0], "Enter")
+        print(OK(f"    reiniciada en {donde[1]}") +
+              ("" if seguir or not s["uuid"] else TENUE(f"  (la conversación anterior: claude -r {s['uuid']})")))
+    return tiene
+
+
+def main():
+    tema = sys.argv[1] if len(sys.argv) > 1 else None
+    resto = sys.argv[2:]
+    if tema == "pasar":
+        exigir_grupos()
+        borrar = "--borrar" in resto
+        resto = [r for r in resto if r != "--borrar"]
+        arbol = None
+        if "--arbol" in resto:
+            k = resto.index("--arbol")
+            if k + 1 >= len(resto):
+                sys.exit("uso: --arbol RAIZ")
+            arbol = resto[k + 1]
+            del resto[k:k + 2]
+        if len(resto) < 2:
+            sys.exit("uso: flota pasar ORIGEN DESTINO: los dos lados, siempre. Un proyecto:\n"
+                     "        flota pasar . pensadero      de acá a su copia en pensadero\n"
+                     "        flota pasar pensadero .      de pensadero a acá\n"
+                     "      un archivo o una carpeta suelta, adonde digas:\n"
+                     "        flota pasar ~/x.pdf pensadero:lineas/linea_a/\n"
+                     "      flota pasar ORIGEN... DESTINO [--arbol RAIZ] [--borrar]")
+        if len(resto) == 2 and not arbol:
+            proyecto = como_proyecto(*resto)
+            if proyecto and archivo_de_proyecto(*proyecto):
+                return pasar(*archivo_de_proyecto(*proyecto), borrar=borrar)
+            if proyecto:
+                return pasar_proyecto(proyecto[0], borrar=borrar, flota_pedida=proyecto[1])
+        return pasar(resto[:-1], resto[-1], borrar=borrar, arbol=arbol)
+    if tema == "mover":
+        exigir_grupos()
+        if len(resto) != 2:
+            sys.exit("uso: flota mover ORIGEN DESTINO   (por ejemplo: codex:repo_clases pensadero)")
+        return mover(*resto)
+    if tema in ("traer", "entregar", "clonar"):
+        exigir_grupos()
+    if tema == "traer" and resto and lugar(resto[0])[0]:
+        if len(resto) > 2:
+            sys.exit("uso: flota traer USUARIO:REPO")
+        u, _, src = lugar(resto[0])
+        for clon in clones():          # a repo you have a clone of: its branches
+            for remoto, nombre in remotos_de_agentes(clon).items():
+                if remoto == u and f"{CASAS}/{u}/work/{nombre}" == src and len(resto) == 1:
+                    return traer(clon)
+        sys.exit(f"flota: {src} is no repository you have a clone of: to copy it, flota pasar")
+    if tema == "traer":
+        if len(resto) > 1:
+            sys.exit("uso: flota traer [CLON]   o   flota traer RUTA [DESTINO]")
+        if resto and not clones(raiz_de(resto[0])):
+            return traer_sin_clon(raiz_de(resto[0]))
+        return traer(raiz_de(resto[0], avisar=True) if resto else None)
+    if tema == "instalar":
+        os.execv(os.path.join(AQUI, "sistema", "instalar"), ["instalar", *resto])
+    if tema == "entregar" and not resto:
+        exigir_grupos()
+        return entregar_todo()
+    if tema == "entregar":
+        if len(resto) not in (1, 2):
+            sys.exit("uso: flota entregar CLON [DESTINO]   (sin DESTINO, a quien ya lo tiene; "
+                     "por ejemplo: flota entregar ~/agents/x claude); para copiar, flota pasar")
+        return entregar_a(raiz_de(resto[0], avisar=True) if not lugar(resto[0])[0] else resto[0], *resto[1:])
+    if tema == "actualizar":
+        if not resto:
+            exigir_grupos()
+            sys.exit(actualizar_flota())
+        if resto != ["codex"]:
+            sys.exit("uso: flota actualizar          trae las ramas de flota y de tu configuración, e instala\n"
+                     "      flota actualizar codex    codex en la versión de fleet.toml (claude se actualiza con "
+                     "el gestor de paquetes: es del sistema)")
+        return actualizar_codex()
+    if tema == "clonar":
+        rama = []
+        if "--rama" in resto:
+            i = resto.index("--rama")
+            rama, resto = resto[i:i + 2], resto[:i] + resto[i + 2:]
+        if len(resto) not in (2, 3) or len(rama) == 1:
+            sys.exit("uso: flota clonar AGENTE REPO [DESTINO] [--rama RAMA]")
+        return clonar(resto + rama)
+    if tema == "estado":
+        if len(resto) > 1:
+            sys.exit("uso: flota estado [CARPETA]   (. para la de acá; o pensadero:proyecto)")
+        if resto:
+            exigir_grupos()
+            estado_carpeta(resto[0])
+            return
+        return estado()
+    if tema == "cluster":
+        if not resto:
+            sys.exit("uso: flota cluster CLUSTER [AGENTE...]")
+        return cluster(resto[0], resto[1:])
+    if tema in ("-h", "--help"):
+        print(__doc__)
+        return
+    if tema == "arrancar":
+        return arrancar(resto)
+    if tema == "reiniciar":
+        return reiniciar(resto)
+    if not tema:
+        pendiente()                 # what needs you now, first; then the cheat sheet
+    chuleta(tema)
+
+
+if __name__ == "__main__":
+    main()

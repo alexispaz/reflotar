@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""vigilar - the one way a session watches work it left on a cluster.
+
+  vigilar SESSION CLUSTER JOB|JOBS|build:RPID [--cada MIN] [--buzon]
+
+It registers itself (fleetregister, with its own pid), asks the cluster with the one
+fixed query fleetwatch uses (`ssh CLUSTER puerta-estado`), every MIN minutes (5 at
+least, the default), and ends with one line:
+
+  terminó: <target> <states>            exit 0, every job COMPLETED (or the build gone)
+  terminó con problemas: <...>          exit 1, a job ended otherwise
+  no pude preguntar 3 veces: dejo de vigilar (<last error>)   exit 2
+
+A failed ssh is "could not ask", never "ended"; three in a row end the watch, and it
+never retries a cluster it cannot reach (conventions rule 5: the admins of a site
+blocked this machine after days of retried ssh to it, 2026-11-18). On its way out it
+clears its registration, so fleetwatch shows the target unwatched if it still runs.
+
+Claude runs it in the background and is woken when it ends. Codex cannot wait past
+its turn: `--buzon` leaves the end line in the session's own mailbox, where the
+despertador (`buzon atento`) wakes it.
+"""
+import getpass, os, re, subprocess, sys, time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from fleet import config as fc
+from fleet import clusters as fcl
+
+NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+JOBS_RE = re.compile(r"\d+(-\d+)?(,\d+(-\d+)?)*")
+MINIMO = 5              # minutes between asks, at least
+FALLOS = 3              # failed asks in a row that end the watch
+AQUI = os.path.dirname(os.path.realpath(__file__))
+
+
+def die(msg, code=2):
+    print(f"vigilar: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def expand(spec):
+    ids = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if hi < lo or hi - lo >= 10000:
+            die(f"{part}: a range goes up, and holds at most 10000 jobs")
+        ids += [str(i) for i in range(lo, hi + 1)]
+    return list(dict.fromkeys(ids))
+
+
+def fleetregister(*args):
+    return subprocess.run([os.path.join(AQUI, "fleetregister"), *map(str, args)],
+                          capture_output=True, text=True)
+
+
+def estado_build(state, rpid, inicio):
+    """'vivo' or 'terminó' for a build, by its pid AND its start time on that node."""
+    p = next((p for p in state["procs"] if str(p["pid"]) == rpid), None)
+    return "vivo" if p and (inicio is None or p["start"] == inicio) else "terminó"
+
+
+def vigilar(session, cname, target, cada, buzon, query=fcl.query, dormir=time.sleep,
+            registrar=fleetregister, avisar=None):
+    cfg = fc.load()
+    agent = getpass.getuser()
+    c = next((x for x in fcl.clusters(cfg, agent) if x["name"] == cname), None)
+    if c is None:
+        die(f"no cluster {cname!r} with a box for {agent} in fleet.toml")
+    build = target.startswith("build:")
+    ids = [] if build else ([target] if target.isdigit() else expand(target))
+    r = registrar(session, cname, target, os.getpid())
+    if r.returncode not in (0, None):
+        die((r.stderr or r.stdout).strip() or "fleetregister refused the target")
+    print(f"vigilando {target} en {cname} cada {cada} min (pid {os.getpid()})", flush=True)
+    fallos, inicio, ultimo, sin_final = 0, None, "", 0
+    try:
+        while True:
+            state = query(c, ids)
+            if not state["complete"]:
+                fallos += 1
+                ultimo = state.get("error", "sin respuesta")
+                print(f"no pude preguntar ({fallos}/{FALLOS}): {ultimo}", flush=True)
+                if fallos >= FALLOS:
+                    return fin(f"no pude preguntar {FALLOS} veces: dejo de vigilar ({ultimo})", 2,
+                               session, cname, target, buzon, avisar)
+                dormir(cada * 60)
+                continue
+            fallos = 0
+            if build:
+                rpid = target.split(":", 1)[1]
+                if inicio is None:
+                    p = next((p for p in state["procs"] if str(p["pid"]) == rpid), None)
+                    inicio = p["start"] if p else None
+                if estado_build(state, rpid, inicio) == "terminó":
+                    return fin(f"terminó: {target} en {cname} ({state['host']})", 0,
+                               session, cname, target, buzon, avisar)
+            else:
+                vivos = {j["parent"] for j in state["jobs"]}
+                if not vivos & set(ids):
+                    sin = [i for i in ids if not state["finals"].get(i)]
+                    if sin and sin_final < FALLOS - 1:      # sacct may lag the queue a little
+                        sin_final += 1
+                        dormir(cada * 60)
+                        continue
+                    finales = {i: ",".join(sorted(state["finals"].get(i, {"sin estado final"})))
+                               for i in ids}
+                    malos = {i: s for i, s in finales.items() if s != "COMPLETED"}
+                    if malos:
+                        detalle = " ".join(f"{i}={s}" for i, s in malos.items())
+                        return fin(f"terminó con problemas: {cname} {detalle}", 1,
+                                   session, cname, target, buzon, avisar)
+                    return fin(f"terminó: {target} en {cname}, COMPLETED", 0,
+                               session, cname, target, buzon, avisar)
+            dormir(cada * 60)
+    finally:
+        registrar("--clear", session, cname, target)
+
+
+def fin(linea, codigo, session, cname, target, buzon, avisar):
+    print(linea, flush=True)
+    if buzon:
+        (avisar or aviso_buzon)(session, cname, linea)
+    return codigo
+
+
+def aviso_buzon(session, cname, linea):
+    """The end line in the session's own mailbox, where the despertador finds it."""
+    subprocess.run(["buzon", "enviar", "--para", f"{getpass.getuser()}/{session}", "--sesion",
+                    session, "--tipo", "aviso", "--asunto", f"vigilar {cname}", "-m", linea],
+                   capture_output=True, text=True)
+
+
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    cada, buzon = MINIMO, False
+    if "--buzon" in a:
+        a.remove("--buzon")
+        buzon = True
+    if "--cada" in a:
+        i = a.index("--cada")
+        try:
+            cada = int(a[i + 1])
+        except (IndexError, ValueError):
+            die("--cada MIN: whole minutes")
+        del a[i:i + 2]
+        if cada < MINIMO:
+            die(f"--cada {cada}: every {MINIMO} minutes at least (conventions rule 5)")
+    if len(a) != 3:
+        die("usage: vigilar SESSION CLUSTER JOB|JOBS|build:RPID [--cada MIN] [--buzon]")
+    session, cname, target = a
+    if not (NAME_RE.fullmatch(session) and NAME_RE.fullmatch(cname)):
+        die("session and cluster are letters, digits, '.', '_' and '-'")
+    if not (re.fullmatch(r"build:\d+", target) or JOBS_RE.fullmatch(target)):
+        die("the target is a job id (its array parent), a range or list of them, or build:<pid>")
+    sys.exit(vigilar(session, cname, target, cada, buzon))
+
+
+if __name__ == "__main__":
+    main()

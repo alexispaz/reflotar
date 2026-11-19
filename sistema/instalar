@@ -1,0 +1,60 @@
+#!/bin/bash
+# instalar -- install or update the fleet on this machine, from YOUR clone of flota and
+# your configuration beside it (flota-<you>/fleet.toml, or $FLOTA_CONFIG).
+#
+#   sistema/instalar         show what would change: the machine's plan (with the diffs
+#                            of every file it installs) and the tools' plan
+#   sistema/instalar --go    the same, then, after you say yes, run the plan with sudo,
+#                            install the tools, and check that nothing is left
+#
+# Run as yourself, never as root and never as an agent. The machine part needs root
+# and goes through sudo only after you have read it; the tools part does not.
+set -euo pipefail
+AQUI=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+PLAN=$HOME/plan-flota.sh
+GO=0; [ "${1:-}" = "--go" ] && GO=1
+
+[ "$(id -u)" = 0 ] && { echo "instalar: corrélo como vos, no como root (usa sudo solo para el plan)"; exit 1; }
+
+# a title that stands out on a terminal; plain text otherwise
+titulo() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then printf '\n\033[1;7;35m %-86s \033[0m\n' "$1"
+  else printf '\n=== %s\n' "$1"; fi
+}
+
+titulo "LA MÁQUINA: reglas, roles, skills, fleet.toml, usuarios, grupos, recursos"
+# the plan goes to the file; the screen gets the report: files that change (diffs),
+# the commands, the notes, and what is left by hand
+python3 "$AQUI/sistema/plan-agentes.py" > "$PLAN"
+bash -n "$PLAN"
+# "# changes: N, routine checks: M": routine checks change nothing when all is in place
+cuentas=$(sed -n 's/^# changes: \([0-9]*\), routine checks: \([0-9]*\)$/\1 \2/p' "$PLAN")
+read -r cambios rutinas <<< "${cuentas:-? ?}"
+if grep -q '^# nothing to do' "$PLAN"; then
+  echo "   nada por instalar en la máquina"
+else
+  if [ "$cambios" = 0 ]; then
+    echo "   nada nuevo en la máquina: solo $rutinas comprobaciones de rutina (no cambian nada si todo está en su lugar)"
+    pregunta="¿Corro las $rutinas comprobaciones de rutina ($PLAN) con sudo? [s/N] "
+  else
+    echo "   $cambios cambio(s) y $rutinas comprobaciones de rutina"
+    pregunta="¿Aplico el plan de la máquina ($PLAN) con sudo? [s/N] "
+  fi
+  if [ $GO = 1 ]; then
+    echo
+    read -r -p "$pregunta" r
+    case $r in s|S|si|sí) sudo bash "$PLAN" ;; *) echo "instalar: no apliqué nada"; exit 1 ;; esac
+  else
+    echo "   plan en $PLAN (revisalo); para aplicarlo: sistema/instalar --go"
+  fi
+fi
+
+titulo "LAS HERRAMIENTAS (sin root)"
+if [ $GO = 1 ]; then
+  "$AQUI/herramientas/install" --go
+  titulo "COMPROBACIÓN"
+  python3 "$AQUI/sistema/plan-agentes.py" 2>/dev/null | head -2
+  "$AQUI/herramientas/install" | tail -1
+else
+  "$AQUI/herramientas/install" || echo "   (las herramientas se instalan después del plan de la máquina, con --go)"
+fi

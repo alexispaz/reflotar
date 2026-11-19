@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""fleetcontext - how much context each live claude session carries, and which to trim.
+
+  fleetcontext            one line per live session of this user, biggest first
+  fleetcontext --json     the same, machine-readable
+  fleetcontext --aviso    one line naming the sessions to compact, or nothing; and
+                          nothing at all within remind_minutes of the last --aviso
+
+Every turn re-sends a session's whole context, so a big session costs more on each
+message than a small one. This shows, per session: the context now (the last turn's
+input + cache tokens), compactions so far, minutes since it was last active, the
+watchers it has registered (fleetregister), and a recommendation:
+
+  ok        below compact_above
+  compact   above compact_above and idle for idle_minutes: type the /compact line
+  later     above compact_above, but active within idle_minutes
+  ?         its transcript could not be found, so its size is not known
+
+It changes nothing and types nothing: the human trims a session in its own pane,
+with the /compact line printed at the end, or starts it afresh after it has saved
+what is pending (a fresh start kills its watchers). Thresholds and the focus of the
+/compact line are [context] in fleet.toml.
+
+--aviso is for the coordinator, at the end of its answers to the human: it costs a
+call and, most of the time, no output. The time of the last check is kept in the
+state folder, so the limit holds whatever the session remembers.
+
+Adapted from fleetcontext in fleet by Cameron F. Abrams (MIT), without its --compact
+and --color, which type into other sessions' panes.
+"""
+import argparse, glob, json, os, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from fleet import config as fc
+from fleet.procs import claude_procs
+from fleet.transcripts import context_stats, session_name
+
+
+def watchers(state):
+    """{session: number of registered watchers}, from fleetregister's records."""
+    out = {}
+    for f in glob.glob(os.path.join(state, "watchers", "*.json")):
+        try:
+            with open(f) as fh:
+                s = json.load(fh).get("session")
+        except (OSError, ValueError):
+            continue
+        if s:
+            out[s] = out.get(s, 0) + 1
+    return out
+
+
+def recommend(tokens, idle_min, ctx):
+    if tokens is None:
+        return "?"
+    if tokens < ctx["compact_above"]:
+        return "ok"
+    return "compact" if idle_min is not None and idle_min >= ctx["idle_minutes"] else "later"
+
+
+def rows(ctx, state, now=None, procs=None):
+    now = now or time.time()
+    vig = watchers(state)
+    out = []
+    for pid, cwd, argv in (claude_procs() if procs is None else procs):
+        name, uuid, _ = session_name(pid, cwd, argv)
+        st = context_stats(uuid) or {}
+        idle = (now - st["mtime"]) / 60 if st.get("mtime") else None
+        tokens = st.get("tokens")
+        out.append({"session": name or f"pid {pid}", "pid": pid, "cwd": cwd, "uuid": uuid,
+                    "tokens": tokens, "compactions": st.get("compactions"),
+                    "idle_minutes": None if idle is None else int(idle),
+                    "watchers": vig.get(name, 0),
+                    "recommend": recommend(tokens, idle, ctx)})
+    out.sort(key=lambda r: -(r["tokens"] or 0))
+    return out
+
+
+def aviso(ctx, state, now=None, rows_fn=None):
+    """The one-line reminder, or None: nothing to compact, or checked too recently."""
+    now = now or time.time()
+    stamp = os.path.join(state, "fleetcontext-aviso")
+    try:
+        if now - os.path.getmtime(stamp) < ctx["remind_minutes"] * 60:
+            return None
+    except OSError:
+        pass
+    os.makedirs(state, exist_ok=True)
+    with open(stamp, "w"):
+        pass
+    os.utime(stamp, (now, now))
+    rs = (rows_fn or rows)(ctx, state, now=now)
+    big = [r for r in rs if r["recommend"] == "compact"]
+    if not big:
+        return None
+    return "Para compactar: " + ", ".join(
+        f"{r['session']} ({ktok(r['tokens'])}, quieta hace {r['idle_minutes']} min"
+        + (f", {r['watchers']} vigilante(s)" if r["watchers"] else "") + ")" for r in big) \
+        + f". En su ventana: /compact {ctx['compact_focus']}".rstrip()
+
+
+def ktok(n):
+    return "?" if n is None else f"{round(n / 1000)}k"
+
+
+def report(rs, ctx):
+    if not rs:
+        print("no live claude session of this user")
+        return
+    print(f"{'session':<14} {'context':>8} {'compact.':>8} {'idle':>8} {'watchers':>8}  recommend")
+    for r in rs:
+        idle = "?" if r["idle_minutes"] is None else f"{r['idle_minutes']} min"
+        print(f"{r['session']:<14} {ktok(r['tokens']):>8} {r['compactions'] if r['compactions'] is not None else '?':>8}"
+              f" {idle:>8} {r['watchers']:>8}  {r['recommend']}")
+    print(f"\ncompact_above = {ktok(ctx['compact_above'])}. To trim one, in its pane:")
+    print(f"  /compact {ctx['compact_focus']}".rstrip())
+    print("A fresh start (/exit, then claude -n NAME without -c) is lighter still, but loses the")
+    print("conversation and kills the session's watchers: first ask it to save what is pending.")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="fleetcontext", description=__doc__.split("\n\n")[1],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--aviso", action="store_true",
+                    help="one line, or nothing; at most once every remind_minutes")
+    a = ap.parse_args(argv)
+    try:
+        cfg = fc.load()
+        ctx = fc.context(cfg)
+    except fc.ConfigError as e:
+        sys.exit(f"fleetcontext: {e}")
+    if a.aviso:
+        linea = aviso(ctx, fc.state_dir(cfg))
+        if linea:
+            print(linea)
+        return
+    rs = rows(ctx, fc.state_dir(cfg))
+    if a.json:
+        json.dump(rs, sys.stdout, indent=1)
+        print()
+    else:
+        report(rs, ctx)
+
+
+if __name__ == "__main__":
+    main()

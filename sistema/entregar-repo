@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""entregar-repo - hand one of your repos to an agent, or bring its copy up to date.
+
+  ./entregar-repo AGENT CLONE            what it would do
+  ./entregar-repo AGENT CLONE --go       do it
+      --name NAME     folder in the agent's ~/work (default: CLONE's folder name);
+                      GROUP/NAME puts it in a folder of related repos, ~/work/GROUP
+      --branch B      the branch to hand over (default: main, else master)
+
+Run as yourself, from YOUR clone of flota. AGENT is a working agent of fleet.toml; CLONE
+is your own clone of the repo (a private one from GitHub, say). The agents have no
+credentials: you are the bridge, both ways.
+
+The first time (the agent has no ~/work/NAME):
+  1. a bundle of CLONE (history only: none of your configuration, remotes or hooks)
+     is written in the agent's ~/work, readable by the agent's group only. Not in
+     /tmp, where every user could read a private repo while it exists;
+  2. the agent clones it (sudo -u AGENT), its origin is removed, the bundle deleted;
+  3. in CLONE, the agent becomes a fetch-only remote, as clonar.py does: the reading
+     process runs as the agent, a push to it fails at once, and it fetches the
+     agent's AGENT/* branches only (not its main: it does not use it).
+Every later time:
+  1. a bundle of BRANCH, which the agent fetches into refs/remotes/<you>/BRANCH.
+     Its own branches are left alone: the session rebases them when it chooses.
+Both times, when BRANCH tracks a remote (main -> origin/main, a private GitHub repo
+the agent cannot reach), that remote's state as of your last `git fetch` goes too:
+the agent gets it as <you>/origin/main, to merge or to branch from.
+
+Git runs as you only in CLONE, and as the agent only in its own copy.
+"""
+import argparse, getpass, os, re, shlex, subprocess, sys
+
+FLEET_TOML = "/home/agents/etc/fleet/fleet.toml"   # installed by the planner
+
+
+def agentes_de_trabajo():
+    """Every AI user of the installed fleet.toml, the pensadero included: its ~/work
+    holds repos like any other's."""
+    import tomllib
+    try:
+        with open(FLEET_TOML, "rb") as f:
+            cfg = tomllib.load(f)
+        agents = cfg.get("ai_users") or cfg.get("agents", {})   # [agents]: the old name
+    except OSError as e:
+        sys.exit(f"cannot read {FLEET_TOML} ({e.strerror}): run the planner first")
+    if not agents:
+        sys.exit(f"no [ai_users] in {FLEET_TOML}: run the planner with your flota-<you>/fleet.toml first")
+    return tuple(agents)
+PUSHURL = "/dev/null/no-push-fetch-only"   # as clonar.py: any push to the agent fails here
+q = shlex.quote
+
+
+def die(msg):
+    sys.exit(f"entregar-repo: {msg}")
+
+
+def git_mine(clone, *args):
+    """git in YOUR clone, as you."""
+    return subprocess.run(["git", "-C", clone, *args], capture_output=True, text=True)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent", help="a working agent of fleet.toml")
+    ap.add_argument("clone")
+    ap.add_argument("--go", action="store_true")
+    ap.add_argument("--name")
+    ap.add_argument("--branch")
+    # tests: stand-ins for `sudo -u AGENT` and the agent's ~/work
+    ap.add_argument("--as-agent", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--agent-work", default=None, help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    AGENTES = agentes_de_trabajo() if not args.as_agent else (args.agent,)
+    if args.agent not in AGENTES:
+        die(f"{args.agent} is not a working agent in {FLEET_TOML}")
+
+    yo = getpass.getuser()
+    if yo in AGENTES and not args.as_agent:
+        die("run it as yourself, not as an agent")
+    clone = os.path.realpath(os.path.expanduser(args.clone))
+    if git_mine(clone, "rev-parse", "--git-dir").returncode != 0:
+        die(f"{clone} is not a git repository")
+    if os.stat(clone).st_uid != os.getuid():
+        die(f"{clone} is not yours: hand over your own clone")
+    name = args.name or os.path.basename(clone)
+    if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)?", name):
+        die("a name is letters, digits, '.', '_' and '-', with at most one GROUP/ before it")
+    branch = args.branch or next((b for b in ("main", "master")
+                                  if git_mine(clone, "rev-parse", "--verify", "-q",
+                                              f"refs/heads/{b}").returncode == 0), None)
+    if not branch or git_mine(clone, "rev-parse", "--verify", "-q",
+                              f"refs/heads/{branch}").returncode != 0:
+        if git_mine(clone, "rev-parse", "--verify", "-q", "HEAD").returncode != 0:
+            die(f"{clone} has no commit yet: commit first (git add -A && git commit), "
+                "on a branch named main (git branch -m main)")
+        die(f"no branch {branch or 'main or master'} in {clone}; name one with --branch")
+
+    as_agent = shlex.split(args.as_agent) if args.as_agent else ["sudo", "-u", args.agent]
+    work = args.agent_work or f"/home/{args.agent}/work"
+    dest = f"{work}/{name}"
+    bundle = f"{work}/entrega-{name.replace('/', '-')}-{os.getpid()}.bundle"
+    # the agent's commands run from "/": it cannot enter the folder you are in, and
+    # git (clone, above all) fails on a current folder it cannot reach
+    exists = subprocess.run(as_agent + ["test", "-e", dest], cwd="/").returncode == 0
+    if exists and subprocess.run(as_agent + ["git", "-C", dest, "rev-parse", "--git-dir"],
+                                 capture_output=True, cwd="/").returncode != 0:
+        die(f"{dest} exists and is not a git repository: look at it first")
+
+    # the upstream BRANCH tracks, as of your last fetch: refs/remotes/origin/main
+    up = git_mine(clone, "rev-parse", "--symbolic-full-name", f"{branch}@{{upstream}}").stdout.strip()
+    up = up if up.startswith("refs/remotes/") else None
+    up_dst = f"refs/remotes/{yo}/{up[len('refs/remotes/'):]}" if up else None
+    steps = []          # (who, argv, what)
+    if not exists:
+        if "/" in name:
+            steps.append(("agent", ["mkdir", "-p", "-m", "2775", os.path.dirname(dest)],
+                          "the folder of related repos (nothing happens if it exists)"))
+        steps += [
+            ("you", ["git", "-C", clone, "bundle", "create", bundle, "--all"],
+             "bundle of your clone, in the agent's ~/work"),
+            ("agent", ["git", "clone", "-q", "--branch", branch, bundle, dest], "the agent clones it"),
+        ]
+        if up:
+            steps.append(("agent", ["git", "-C", dest, "fetch", "-q", bundle, f"+{up}:{up_dst}"],
+                          f"and {up[len('refs/remotes/'):]}, as {up_dst[len('refs/remotes/'):]}"))
+        steps.append(("agent", ["git", "-C", dest, "remote", "remove", "origin"], "no link back to the bundle"))
+        remotes = git_mine(clone, "remote").stdout.split()
+        upload = f"sudo -H -u {args.agent} git-upload-pack"
+        if args.agent not in remotes:
+            steps.append(("you", ["git", "-C", clone, "remote", "add", "-t", branch, args.agent, dest],
+                          f"{args.agent} as a remote of your clone"))
+        steps += [
+            ("you", ["git", "-C", clone, "config", f"remote.{args.agent}.uploadpack", upload],
+             "fetching reads the agent's repo AS THE AGENT"),
+            ("you", ["git", "-C", clone, "config", f"remote.{args.agent}.pushurl", PUSHURL],
+             "a push to the agent fails here, at once"),
+        ]
+        # only its <agent>/* branches: never its main, which it does not use (conventions
+        # rule 12) and may delete, and a missing ref in a refspec aborts the whole fetch
+        refspec = f"+refs/heads/{args.agent}/*:refs/remotes/{args.agent}/*"
+        if git_mine(clone, "config", "--get-all", f"remote.{args.agent}.fetch").stdout.split() != [refspec]:
+            steps.append(("you", ["git", "-C", clone, "config", "--replace-all", f"remote.{args.agent}.fetch",
+                                  refspec], f"fetch only its {args.agent}/* branches"))
+    else:
+        steps += [
+            ("you", ["git", "-C", clone, "bundle", "create", bundle, branch, *([up] if up else [])],
+             f"bundle of your {branch}" + (f" and {up[len('refs/remotes/'):]}" if up else "")),
+            ("agent", ["git", "-C", dest, "fetch", "-q", bundle,
+                       f"+refs/heads/{branch}:refs/remotes/{yo}/{branch}",
+                       *([f"+{up}:{up_dst}"] if up else [])],
+             f"the agent gets it as {yo}/{branch}" + (f" and {up_dst[len('refs/remotes/'):]}" if up else "")
+             + "; its branches are left alone"),
+        ]
+    steps.append(("you", ["rm", "-f", bundle], "the bundle is not needed any more"))
+
+    print(f"repo    : {clone} ({branch})")
+    print(f"agent   : {args.agent} -> {dest} ({'update' if exists else 'first delivery'})")
+    print("MODE    : " + ("DOING IT" if args.go else "plan only (--go to apply)") + "\n")
+    for who, cmd, what in steps:
+        shown = ("sudo -u " + args.agent + " " if who == "agent" else "") + " ".join(map(q, cmd))
+        print(f"  {shown}\n      # {what}")
+    if not args.go:
+        return 0
+    os.umask(0o027)                     # the bundle: you and the agent's group, nobody else
+    print()
+    try:
+        for who, cmd, what in steps[:-1]:
+            r = subprocess.run((as_agent if who == "agent" else []) + cmd,
+                               cwd="/" if who == "agent" else None)
+            if r.returncode != 0:
+                die(f"failed: {' '.join(cmd)}")
+    finally:
+        subprocess.run(["rm", "-f", bundle])
+    if exists:
+        print(f"done. The session in {dest} sees your {branch} as {yo}/{branch}.")
+    else:
+        print(f"done. Tell the coordinator the repo is at {dest}. From your clone:\n"
+              f"  git fetch {args.agent}; git diff {branch}...{args.agent}/<topic>; "
+              f"git merge --ff-only {args.agent}/<topic>")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
