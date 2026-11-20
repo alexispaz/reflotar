@@ -1,5 +1,14 @@
 # reflotar
 
+**RE**thinking Cameron Abrams's fleet from an **AR**gentine team.
+
+![The architecture of flota, as drawn for a class (in Spanish)](reflotar.png)
+
+reflotar starts from the idea of [fleet](https://github.com/cameronabrams/fleet), by
+Cameron F. Abrams, and adapts it to a research group at the UNC, in Córdoba,
+Argentina. It has since diverged to fit that group's own use: its machines, its HPC
+clusters, and the way its members work with agents.
+
 A fleet of AI coding agents on one Linux machine, for a research group: each AI
 user is its own Linux user, the human's account is never reachable, and on HPC
 clusters each AI user works inside a box of the human's account. MIT licensed; see
